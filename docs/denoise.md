@@ -6,15 +6,24 @@ preserves Amount and mixes none of the cleaned picture. It affects only the requ
 photo, independently of Auto Sync, and is undoable. Manual luminance and colour noise
 reduction remain separate controls.
 
-If no model is selected, turning it on opens **Settings ▸ AI Denoise** without changing
-the photo. After installation, the pending request enables the original photo even if
-the selection changed. Cancel the pending action in Settings. Cancelled downloads,
-deleted or relinked photos, switching libraries and quitting cancel the request.
-An active slider gesture finishes before the pending action resumes.
+## The built-in denoiser
 
-## Models and terms
+AI Denoise needs no set-up. Unless you choose a model of your own (below), it runs the
+**built-in denoiser** (`crates/denoise-core/src/builtin.rs`, id `builtin`): it measures
+the photo's noise level (variance = a · signal + b, fitted per tile from the tile itself),
+cleans each Bayer colour plane with a signal-adaptive non-local-means filter, then
+demosaics with edge-directed green and colour-difference red and blue. It is written for
+LightCraft, pure Rust, MIT OR Apache-2.0, has no weights and no download, and uses the
+same tiling, cache, queue, preview and export path as a model. Its tile is 256 cells with a
+16-cell overlap; it runs on the processor (the GPU setting does not apply to it). A change
+to the algorithm bumps `builtin::VERSION`, so cached pictures are made again. The id
+`builtin` is reserved: a model with that id is refused. It is a classical filter, not a
+trained network, so a good model can still do better on very noisy files.
 
-**No model weights are bundled.** Models live in the per-user `denoise-models` folder
+## Models and terms (optional)
+
+**No model weights are bundled.** Choosing a model replaces the built-in denoiser; **Stop using**
+(or removing the model) goes back to it. Models live in the per-user `denoise-models` folder
 (override with `LIGHTCRAFT_DENOISE_MODELS`). Settings provides **Install from file…**
 for a user-supplied ONNX file with a `denoise-model.json` beside it. The default build
 offers no model downloads. The separate `rawnind-model` Cargo feature enables the

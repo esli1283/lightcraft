@@ -110,6 +110,33 @@ pub(crate) trait Model: Send + Sync {
     }
 }
 
+/// The built-in denoiser (`lightcraft_denoise::builtin`): nothing to load, so it is what runs until a model is chosen.
+struct BuiltinModel;
+
+impl Model for BuiltinModel {
+    fn runner(&self, _run_on: RunOn, threads: usize) -> (&dyn TileRunner, usize) {
+        (&lightcraft_denoise::builtin::Builtin, threads)
+    }
+
+    fn self_test(&self, _run_on: RunOn) -> Result<Value, String> {
+        let side = 16;
+        let out = lightcraft_denoise::builtin::Builtin.run(&vec![0.25; 4 * side * side]).map_err(|e| e.to_string())?;
+        if out.len() != 12 * side * side || out.iter().any(|v| !v.is_finite()) {
+            return Err("the built-in denoiser gave an unexpected result".into());
+        }
+        Ok(json!({"ok": true, "builtin": true}))
+    }
+
+    /// Planes, the two mosaics and the working copies of a 256-cell tile.
+    fn bytes_per_tile(&self) -> usize {
+        64 * 1024 * 1024
+    }
+
+    fn device(&self, _run_on: RunOn) -> Value {
+        json!({"kind": "cpu", "reason": "built-in"})
+    }
+}
+
 /// Loads the model at a path as its manifest describes it.
 pub(crate) type Loader = Arc<dyn Fn(&Path, &DenoiserManifest) -> Result<Arc<dyn Model>, String> + Send + Sync>;
 
@@ -717,7 +744,7 @@ pub(crate) fn installed_models(dir: &Path) -> Vec<Installed> {
         let p = e.path();
         let Some(name) = p.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
         let onnx = p.join("model.onnx");
-        if !lightcraft_denoise::licence::valid_id(&name) || !p.is_dir() || !onnx.is_file() {
+        if name == lightcraft_denoise::builtin::ID || !lightcraft_denoise::licence::valid_id(&name) || !p.is_dir() || !onnx.is_file() {
             continue;
         }
         let Some(m) = read_capped(&p.join("denoise-model.json"), lightcraft_denoise::manifest::MAX_MANIFEST_BYTES)
@@ -868,6 +895,9 @@ impl Progress {
 
 /// The loaded model, loading it first when it is not (kept for the next photo).
 fn loaded(spec: &JobSpec) -> Result<Arc<dyn Model>, MakeError> {
+    if spec.manifest.id == lightcraft_denoise::builtin::ID {
+        return Ok(Arc::new(BuiltinModel));
+    }
     if let Some(m) = spec.model.lock().unwrap_or_else(PoisonError::into_inner).clone() {
         return Ok(m);
     }
@@ -1016,8 +1046,6 @@ impl Pace {
 pub enum PhotoState {
     /// Not a photo denoise applies to (not a raw, offline, a demo).
     NotApplicable,
-    /// No model is chosen: nothing can be made.
-    NoModel,
     /// Its picture is made: the Amount slider works.
     Ready,
     Queued {
@@ -1168,23 +1196,19 @@ impl Session {
             let id = self.denoise.settings.model.clone()?;
             installed_models(dir).into_iter().find(|i| i.manifest.id == id)
         });
-        let found = chosen.map(|i| (i.fingerprint(), i));
-        let same = match (&self.denoise.active, &found) {
-            (None, None) => true,
-            (Some(a), Some((fp, _))) => a.fingerprint == *fp,
-            _ => false,
+        // without a model of the user's own the built-in denoiser is in use, so AI Denoise needs no set-up
+        let (fingerprint, manifest, onnx) = match chosen {
+            Some(i) => (i.fingerprint(), i.manifest, i.onnx),
+            None => {
+                let manifest = lightcraft_denoise::builtin::manifest();
+                (format!("{}@{}", manifest.id, manifest.version), manifest, PathBuf::new())
+            }
         };
-        if same {
+        if self.denoise.active.as_ref().is_some_and(|a| a.fingerprint == fingerprint) {
             return;
         }
         // another model: what was made with the old one is not this one's, and what failed may work now
-        self.denoise.active = found.map(|(fingerprint, i)| Active {
-            id: i.manifest.id.clone(),
-            manifest: i.manifest,
-            onnx: i.onnx,
-            fingerprint,
-            model: Arc::new(Mutex::new(None)),
-        });
+        self.denoise.active = Some(Active { id: manifest.id.clone(), manifest, onnx, fingerprint, model: Arc::new(Mutex::new(None)) });
         if let Some(r) = self.denoise.running.take() {
             r.progress.cancel_now();
         }
@@ -1273,8 +1297,8 @@ impl Session {
             return PhotoState::NotApplicable;
         }
         if self.denoise.active.is_none() {
-            // the model folder has not been looked at yet (just started): not "no model" until it has been
-            return if self.denoise.active_seen.is_none() { PhotoState::Idle } else { PhotoState::NoModel };
+            // the model in use has not been looked at yet (just started)
+            return PhotoState::Idle;
         }
         if self.denoise_products_dir().is_none() {
             return PhotoState::Failed {

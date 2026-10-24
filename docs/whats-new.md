@@ -2,6 +2,15 @@
 
 ## 2026-10-23
 
+### AI Denoise works out of the box
+- Turning on AI Denoise no longer asks for an ONNX model and a `denoise-model.json`: LightCraft's own built-in
+  denoiser runs automatically. Installing a model of your own is optional (Settings ▸ AI Denoise ▸ Your own model);
+  Stop using returns to the built-in one. The set-up prompt and its "resume after installing" flow are gone. See
+  [AI Denoise](denoise.md).
+- The built-in denoiser measures the photo's noise once, cleans the four colour planes together on variance-stabilised
+  data (so colour blotches go too), and cleans harder, with a second pass, the noisier the photo is. On a public raw with
+  added noise it scores 3.6 to 9.7 dB higher than the noisy picture, the most at heavy noise.
+
 ### Tab leaves the name field in New Album, New Smart Album and the name prompts
 - In New Album, New Smart Album, Save Metadata Preset and the other dialogs with one name field, the field has the
   keyboard focus when the dialog opens, and Tab now moves on to the check box, Cancel and OK (Shift+Tab goes back).
@@ -1139,7 +1148,7 @@
 
 ### AI RAW denoise
 - Detail has a per-photo AI Denoise switch and Amount. Bayer RAW photos use a disposable cache, with matching previews and exports and pure-Rust CPU/GPU inference.
-- Models are installed separately after accepting their terms; no weights are bundled. See [setup and limitations](denoise.md).
+- Optional models are installed separately after accepting their terms; no weights are bundled. See [setup and limitations](denoise.md).
 
 ### Library keyboard culling
 - Colour labels tint thumbnail surrounds in Square Grid and the Detail filmstrip, and a translucent footer along the bottom of the photo in Photo Grid. Label confirmations use a matching pale colour.
