@@ -1,28 +1,27 @@
 //! The built-in denoiser: what AI Denoise runs when no model has been installed, so it works out of the box.
 //!
 //! It is a [`TileRunner`] with the same contract as a model (four Bayer planes in, camera RGB at twice the plane
-//! size out), written from scratch and needing no file: the noise level of the tile is measured from the tile itself
-//! (Poisson-Gaussian: variance = a · signal + b), each colour plane is cleaned with a signal-adaptive non-local-means
-//! filter, and the cleaned mosaic is demosaiced with edge-directed green and colour-difference red and blue.
+//! size out), written from scratch and needing no file: the noise level of the photo is measured from the photo itself
+//! (Poisson-Gaussian: variance = a · signal + b; [`estimate_noise`], with a tile's own measure as the fallback), the
+//! four planes are cleaned together by a non-local-means filter on variance-stabilised data ([`crate::nlm`]), which
+//! cleans harder and in a second pass as the noise grows, and the cleaned mosaic is demosaiced with edge-directed
+//! green and colour-difference red and blue.
 
 use crate::bayer::reflect;
 use crate::licence::{Commercial, Licence};
 use crate::manifest::{DenoiserManifest, Domain, Gain};
+use crate::nlm::{self, Stabiliser, Tuning};
 use crate::run::{Error, TileRunner};
 
 /// Id of the built-in denoiser; no installed model may use it (the models folder is never searched for it).
 pub const ID: &str = "builtin";
 /// Changes when the algorithm does, so that cached pictures made by an older one are made again.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Side of its tile, in cells.
 pub const TILE: u32 = 256;
 /// Cells neighbouring tiles share.
 pub const OVERLAP: u32 = 16;
 
-/// Search window radius of the non-local means, in cells.
-const SEARCH: isize = 2;
-/// How far above the noise two patches may differ and still be averaged (larger blurs more).
-const STRENGTH: f32 = 1.0;
 /// Cells on a side of the blocks the noise level is measured over.
 const BLOCK: usize = 16;
 /// The smallest variance used, so that a clean tile is left alone instead of divided by zero.
@@ -53,19 +52,35 @@ pub fn manifest() -> DenoiserManifest {
     }
 }
 
-/// The built-in denoiser as a tile runner (it holds no state).
+/// The built-in denoiser as a tile runner.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Builtin;
+pub struct Builtin {
+    /// The noise of the whole photo as `(a, b)`, variance = `a · signal + b` (see [`estimate_noise`]). Without it each
+    /// tile measures its own, which is rougher and can show as a change of strength between tiles.
+    pub noise: Option<(f32, f32)>,
+    pub tuning: Tuning,
+}
+
+impl Builtin {
+    pub fn with_noise(noise: (f32, f32)) -> Self {
+        Builtin { noise: Some(noise), tuning: Tuning::default() }
+    }
+}
 
 impl TileRunner for Builtin {
     fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
         let t = side_of(input.len()).ok_or_else(|| Error::Input("the tile is not four square planes".into()))?;
         let clean: Vec<f32> = input.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect();
         let n = t * t;
-        let planes: Vec<&[f32]> = clean.chunks_exact(n).collect();
-        let (a, b) = noise_model(&planes, t);
-        let denoised: Vec<Vec<f32>> = planes.iter().map(|p| non_local_means(p, t, a, b)).collect();
-        Ok(demosaic(&denoised, t))
+        let (a, b) = match self.noise {
+            Some((a, b)) if a.is_finite() && b.is_finite() => (a, b),
+            _ => noise_model(&clean.chunks_exact(n).collect::<Vec<_>>(), t),
+        };
+        let st = Stabiliser::new(a, b);
+        let stabilised: Vec<Vec<f32>> = clean.chunks_exact(n).map(|p| p.iter().map(|&v| st.forward(v)).collect()).collect();
+        let cleaned = nlm::filter(&stabilised, t, &self.tuning, (a * 0.18 + b).max(0.0).sqrt());
+        let planes: Vec<Vec<f32>> = cleaned.iter().map(|p| p.iter().map(|&v| st.inverse(v)).collect()).collect();
+        Ok(demosaic(&planes, t))
     }
 }
 
@@ -74,30 +89,6 @@ fn side_of(len: usize) -> Option<usize> {
     let per = len / 4;
     let t = (per as f64).sqrt().round() as usize;
     (len.is_multiple_of(4) && (8..=2048).contains(&t) && t * t == per).then_some(t)
-}
-
-/// Mean of each 3 × 3 neighbourhood (edge cells repeated).
-fn box3(src: &[f32], t: usize) -> Vec<f32> {
-    let at = |x: isize, y: isize| src.get(y.clamp(0, t as isize - 1) as usize * t + x.clamp(0, t as isize - 1) as usize).copied().unwrap_or(0.0);
-    let mut rows = vec![0f32; t * t];
-    for y in 0..t {
-        for x in 0..t {
-            let (xi, yi) = (x as isize, y as isize);
-            if let Some(r) = rows.get_mut(y * t + x) {
-                *r = at(xi - 1, yi) + at(xi, yi) + at(xi + 1, yi);
-            }
-        }
-    }
-    let row = |x: usize, y: isize| rows.get(y.clamp(0, t as isize - 1) as usize * t + x).copied().unwrap_or(0.0);
-    let mut out = vec![0f32; t * t];
-    for y in 0..t {
-        for x in 0..t {
-            if let Some(o) = out.get_mut(y * t + x) {
-                *o = (row(x, y as isize - 1) + row(x, y as isize) + row(x, y as isize + 1)) / 9.0;
-            }
-        }
-    }
-    out
 }
 
 /// Measure the noise of a tile: `(a, b)` with variance = `a · signal + b`. Each block of a plane gives the signal
@@ -132,6 +123,49 @@ fn noise_model(planes: &[&[f32]], t: usize) -> (f32, f32) {
             by += BLOCK;
         }
     }
+    fit_noise(blocks)
+}
+
+/// The noise of a whole mosaic as `(a, b)` (variance = `a · signal + b`), from blocks spread over the picture.
+pub fn estimate_noise(mosaic: &[f32], width: usize, height: usize) -> (f32, f32) {
+    const SIDE: usize = 32;
+    const MOST_BLOCKS: usize = 6000;
+    let mut blocks: Vec<(f32, f32)> = Vec::new();
+    if width < SIDE + 4 || height < SIDE + 4 || width.checked_mul(height) != Some(mosaic.len()) {
+        return (0.0, MIN_VARIANCE);
+    }
+    let total = (width / SIDE).saturating_mul(height / SIDE);
+    let skip = (total / MOST_BLOCKS + 1).isqrt().max(1);
+    let at = |x: usize, y: usize| mosaic.get(y * width + x).copied().unwrap_or(0.0);
+    let mut by = 2;
+    while by + SIDE + 2 <= height {
+        let mut bx = 2;
+        while bx + SIDE + 2 <= width {
+            let (mut sum, mut sq) = (0f64, 0f64);
+            for y in by..by + SIDE {
+                for x in bx..bx + SIDE {
+                    let c = at(x, y);
+                    // the neighbours of the same colour, two samples away
+                    let r = c - 0.25 * (at(x - 2, y) + at(x + 2, y) + at(x, y - 2) + at(x, y + 2));
+                    sum += f64::from(c);
+                    sq += f64::from(r * r);
+                }
+            }
+            let cells = (SIDE * SIDE) as f64;
+            let (mean, variance) = ((sum / cells) as f32, (sq / cells / 1.25) as f32);
+            if mean < CLIPPED && mean.is_finite() && variance.is_finite() {
+                blocks.push((mean, variance));
+            }
+            bx += SIDE * skip;
+        }
+        by += SIDE * skip;
+    }
+    fit_noise(blocks)
+}
+
+/// Fit `variance = a · signal + b` through the `(mean, variance)` of blocks: the quieter part of the variances at
+/// each brightness is the noise (texture and edges only raise a block's variance), and a line is fitted through them.
+fn fit_noise(mut blocks: Vec<(f32, f32)>) -> (f32, f32) {
     if blocks.is_empty() {
         return (0.0, MIN_VARIANCE);
     }
@@ -163,53 +197,8 @@ fn noise_model(planes: &[&[f32]], t: usize) -> (f32, f32) {
     (a.max(0.0) as f32, (b.max(0.0) as f32).max(MIN_VARIANCE))
 }
 
-/// Clean one plane: every cell becomes the average of the cells around it whose 3 × 3 patch looks like its own,
-/// judged against the noise its brightness has.
-fn non_local_means(src: &[f32], t: usize, a: f32, b: f32) -> Vec<f32> {
-    let n = t * t;
-    let sigma2: Vec<f32> = box3(src, t).into_iter().map(|m| (a * m.max(0.0) + b).max(MIN_VARIANCE)).collect();
-    let (mut num, mut den, mut peak) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-    let mut diff = vec![0f32; n];
-    let last = t as isize - 1;
-    for oy in -SEARCH..=SEARCH {
-        for ox in -SEARCH..=SEARCH {
-            if ox == 0 && oy == 0 {
-                continue;
-            }
-            let other = |i: usize| -> usize {
-                let (x, y) = ((i % t) as isize, (i / t) as isize);
-                (y + oy).clamp(0, last) as usize * t + (x + ox).clamp(0, last) as usize
-            };
-            for (i, d) in diff.iter_mut().enumerate() {
-                let v = src.get(i).copied().unwrap_or(0.0) - src.get(other(i)).copied().unwrap_or(0.0);
-                *d = v * v;
-            }
-            let patch = box3(&diff, t);
-            for i in 0..n {
-                let (Some(&d2), Some(&s2)) = (patch.get(i), sigma2.get(i)) else { continue };
-                let w = (-((d2 - 2.0 * s2).max(0.0)) / (STRENGTH * s2)).exp();
-                let value = src.get(other(i)).copied().unwrap_or(0.0);
-                if let (Some(nu), Some(de), Some(pk)) = (num.get_mut(i), den.get_mut(i), peak.get_mut(i)) {
-                    *nu += w * value;
-                    *de += w;
-                    *pk = pk.max(w);
-                }
-            }
-        }
-    }
-    // the cell itself counts as much as its best match
-    (0..n)
-        .map(|i| {
-            let own = src.get(i).copied().unwrap_or(0.0);
-            let (nu, de, pk) = (num.get(i).copied().unwrap_or(0.0), den.get(i).copied().unwrap_or(0.0), peak.get(i).copied().unwrap_or(0.0));
-            let w = pk.max(1e-3);
-            (nu + w * own) / (de + w)
-        })
-        .collect()
-}
-
-/// Demosaic the four denoised planes of an RGGB tile into camera RGB planes `[R, G, B]` of `2t × 2t`.
-fn demosaic(planes: &[Vec<f32>], t: usize) -> Vec<f32> {
+/// Demosaic four planes `[R, G1, G2, B]` of an RGGB tile into camera RGB planes `[R, G, B]` of `2t × 2t`.
+pub fn demosaic(planes: &[Vec<f32>], t: usize) -> Vec<f32> {
     let s = 2 * t;
     let si = s as isize;
     // the mosaic: R at (even, even), G1 at (odd, even), G2 at (even, odd), B at (odd, odd)
@@ -352,7 +341,7 @@ mod tests {
         let input = mosaic_planes(&truth, t, a, b, 7);
         let planes: Vec<Vec<f32>> = input.chunks_exact(t * t).map(<[f32]>::to_vec).collect();
         let plain = error(&demosaic(&planes, t), &truth, 2 * t);
-        let cleaned = error(&Builtin.run(&input).unwrap(), &truth, 2 * t);
+        let cleaned = error(&Builtin::default().run(&input).unwrap(), &truth, 2 * t);
         assert!(cleaned < plain / 5.0, "plain {plain}, cleaned {cleaned}");
     }
 
@@ -361,7 +350,7 @@ mod tests {
         let t = 64;
         let truth = scene(2 * t);
         let input = mosaic_planes(&truth, t, 0.0, 0.0, 1);
-        let out = Builtin.run(&input).unwrap();
+        let out = Builtin::default().run(&input).unwrap();
         assert!(error(&out, &truth, 2 * t) < 2e-5);
         // the step between rows 63 and 65 survives
         let s = 2 * t;
@@ -386,7 +375,7 @@ mod tests {
     fn flat_dark_and_clipped_tiles_do_not_break_it() {
         let t = 32;
         for v in [0.0f32, 0.5, 1.0] {
-            let out = Builtin.run(&vec![v; 4 * t * t]).unwrap();
+            let out = Builtin::default().run(&vec![v; 4 * t * t]).unwrap();
             assert_eq!(out.len(), 3 * 4 * t * t);
             assert!(out.iter().all(|x| x.is_finite() && (x - v).abs() < 1e-4), "{v}");
         }
@@ -394,13 +383,65 @@ mod tests {
 
     #[test]
     fn bad_tiles_are_errors_and_bad_numbers_are_cleaned_up() {
-        assert!(Builtin.run(&[]).is_err());
-        assert!(Builtin.run(&[0.0; 30]).is_err());
-        assert!(Builtin.run(&vec![0.0; 4 * 9 * 10]).is_err());
+        assert!(Builtin::default().run(&[]).is_err());
+        assert!(Builtin::default().run(&[0.0; 30]).is_err());
+        assert!(Builtin::default().run(&vec![0.0; 4 * 9 * 10]).is_err());
         let mut input = vec![0.3f32; 4 * 16 * 16];
         input[5] = f32::NAN;
         input[77] = f32::INFINITY;
-        assert!(Builtin.run(&input).unwrap().iter().all(|v| v.is_finite()));
+        assert!(Builtin::default().run(&input).unwrap().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn the_noise_of_a_whole_mosaic_is_found_and_hostile_mosaics_are_refused() {
+        let (s, a, b) = (384, 0.01f32, 0.0005f32);
+        let truth = scene(s);
+        let mut rng = Noise(5);
+        let mosaic: Vec<f32> = (0..s * s)
+            .map(|i| {
+                let (x, y) = (i % s, i / s);
+                let v = truth[[0, 1, 1, 2][(y % 2) * 2 + x % 2]][i];
+                v + rng.normal() * (a * v + b).sqrt()
+            })
+            .collect();
+        let (ea, eb) = estimate_noise(&mosaic, s, s);
+        for signal in [0.2f32, 0.5] {
+            let (want, got) = (a * signal + b, ea * signal + eb);
+            assert!((got / want - 1.0).abs() < 0.25, "at {signal}: {got} against {want}");
+        }
+        // too small, or not the size it says: no estimate, and no panic
+        assert_eq!(estimate_noise(&mosaic, 10, 10).1, MIN_VARIANCE);
+        assert_eq!(estimate_noise(&mosaic, s, s - 1).1, MIN_VARIANCE);
+        assert_eq!(estimate_noise(&[], 0, 0).1, MIN_VARIANCE);
+        assert_eq!(estimate_noise(&mosaic, usize::MAX, usize::MAX).1, MIN_VARIANCE);
+    }
+
+    #[test]
+    fn a_heavily_noisy_tile_is_cleaned_far_more_than_a_plain_demosaic_and_by_the_photos_noise() {
+        let (t, a, b) = (64, 0.03, 0.004);
+        let truth = scene(2 * t);
+        let input = mosaic_planes(&truth, t, a, b, 9);
+        let planes: Vec<Vec<f32>> = input.chunks_exact(t * t).map(<[f32]>::to_vec).collect();
+        let plain = error(&demosaic(&planes, t), &truth, 2 * t);
+        let own = error(&Builtin::default().run(&input).unwrap(), &truth, 2 * t);
+        let told = error(&Builtin::with_noise((a, b)).run(&input).unwrap(), &truth, 2 * t);
+        assert!(own < plain / 8.0 && told < plain / 8.0, "plain {plain}, own {own}, told {told}");
+    }
+
+    #[test]
+    fn noise_values_that_are_not_numbers_fall_back_to_the_tiles_own_and_the_strength_follows_the_noise() {
+        let t = 32;
+        let input = vec![0.3f32; 4 * t * t];
+        for bad in [(f32::NAN, 1e-3), (0.01, f32::INFINITY), (-1.0, -1.0)] {
+            let out = Builtin { noise: Some(bad), tuning: Tuning::default() }.run(&input).unwrap();
+            assert!(out.iter().all(|v| v.is_finite()), "{bad:?}");
+        }
+        // no search at all is a plain demosaic, not a crash
+        let none = Builtin { noise: Some((0.01, 1e-3)), tuning: Tuning { search: 0, search2: 0, ..Tuning::default() } };
+        assert!(none.run(&input).unwrap().iter().all(|v| v.is_finite()));
+        let tune = Tuning::default();
+        let ramp: Vec<f32> = [0.0, 0.02, 0.05, 0.1, 0.2].iter().map(|&n| tune.strength(n)).collect();
+        assert!(ramp.windows(2).all(|w| w[0] <= w[1]) && ramp[0] == 0.0 && ramp[4] == 1.0, "{ramp:?}");
     }
 
     #[test]

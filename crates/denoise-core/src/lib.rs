@@ -9,6 +9,7 @@ pub mod hash;
 pub mod known;
 pub mod licence;
 pub mod manifest;
+pub mod nlm;
 pub mod product;
 pub mod run;
 pub mod tiles;

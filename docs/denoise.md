@@ -10,9 +10,13 @@ reduction remain separate controls.
 
 AI Denoise needs no set-up. Unless you choose a model of your own (below), it runs the
 **built-in denoiser** (`crates/denoise-core/src/builtin.rs`, id `builtin`): it measures
-the photo's noise level (variance = a · signal + b, fitted per tile from the tile itself),
-cleans each Bayer colour plane with a signal-adaptive non-local-means filter, then
-demosaics with edge-directed green and colour-difference red and blue. It is written for
+the photo's noise level once, from blocks spread over the whole mosaic (variance =
+a · signal + b), turns the noise into unit variance with a variance-stabilising transform,
+and cleans the four Bayer planes together with a non-local-means filter: matches are judged
+on all planes at once, so colour noise is cleaned with the brightness. It cleans gently
+at low noise (to keep fine detail) and harder, with a second pass that finds matches on
+the first pass's cleaner picture, as the noise grows. It then demosaics with edge-directed
+green and colour-difference red and blue. It is written for
 LightCraft, pure Rust, MIT OR Apache-2.0, has no weights and no download, and uses the
 same tiling, cache, queue, preview and export path as a model. Its tile is 256 cells with a
 16-cell overlap; it runs on the processor (the GPU setting does not apply to it). A change

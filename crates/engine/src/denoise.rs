@@ -98,6 +98,9 @@ pub(crate) trait Model: Send + Sync {
     /// Check it does something sensible: the test's result, or why not. Unless `run_on` is the processor the graphics
     /// card is set up and checked too, and the result says where the work will run.
     fn self_test(&self, run_on: RunOn) -> Result<Value, String>;
+    /// Look at the photo's whole mosaic before its tiles run (a model that measures the noise from the photo does it
+    /// here, so every tile is cleaned by the same measure).
+    fn prepare(&self, _mosaic: &[f32], _width: usize, _height: usize) {}
     /// Conservative scratch bound for an unknown runner.
     fn bytes_per_tile(&self) -> usize {
         512 * 1024 * 1024
@@ -111,16 +114,23 @@ pub(crate) trait Model: Send + Sync {
 }
 
 /// The built-in denoiser (`lightcraft_denoise::builtin`): nothing to load, so it is what runs until a model is chosen.
-struct BuiltinModel;
+#[derive(Default)]
+struct BuiltinModel {
+    runner: OnceLock<lightcraft_denoise::builtin::Builtin>,
+}
 
 impl Model for BuiltinModel {
     fn runner(&self, _run_on: RunOn, threads: usize) -> (&dyn TileRunner, usize) {
-        (&lightcraft_denoise::builtin::Builtin, threads)
+        (self.runner.get_or_init(Default::default), threads)
+    }
+
+    fn prepare(&self, mosaic: &[f32], width: usize, height: usize) {
+        let _ = self.runner.set(lightcraft_denoise::builtin::Builtin::with_noise(lightcraft_denoise::builtin::estimate_noise(mosaic, width, height)));
     }
 
     fn self_test(&self, _run_on: RunOn) -> Result<Value, String> {
         let side = 16;
-        let out = lightcraft_denoise::builtin::Builtin.run(&vec![0.25; 4 * side * side]).map_err(|e| e.to_string())?;
+        let out = lightcraft_denoise::builtin::Builtin::default().run(&vec![0.25; 4 * side * side]).map_err(|e| e.to_string())?;
         if out.len() != 12 * side * side || out.iter().any(|v| !v.is_finite()) {
             return Err("the built-in denoiser gave an unexpected result".into());
         }
@@ -896,7 +906,7 @@ impl Progress {
 /// The loaded model, loading it first when it is not (kept for the next photo).
 fn loaded(spec: &JobSpec) -> Result<Arc<dyn Model>, MakeError> {
     if spec.manifest.id == lightcraft_denoise::builtin::ID {
-        return Ok(Arc::new(BuiltinModel));
+        return Ok(Arc::new(BuiltinModel::default()));
     }
     if let Some(m) = spec.model.lock().unwrap_or_else(PoisonError::into_inner).clone() {
         return Ok(m);
@@ -955,6 +965,7 @@ pub(crate) fn make_product(spec: &JobSpec, progress: Option<&Progress>) -> Resul
     }
     let decoded = began.elapsed();
     let model = loaded(spec)?;
+    model.prepare(&mosaic.data, mosaic.width, mosaic.height);
     // Packed input, returned RGB and the preceding group's RGB overlap while tiles run.
     let scratch =
         model.bytes_per_tile().saturating_add(128usize.saturating_mul(spec.manifest.tile as usize).saturating_mul(spec.manifest.tile as usize));
