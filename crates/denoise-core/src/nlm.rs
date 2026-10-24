@@ -29,11 +29,37 @@ pub struct Tuning {
     /// Noise at mid-grey where the stronger settings start and where they are in full.
     pub light: f32,
     pub heavy: f32,
+    /// Search radius and threshold of the colour-difference planes' own pass, guided by the cleaned brightness
+    /// plane (colour noise is the cheapest to remove without losing texture); radius 0 skips it.
+    pub search_c: usize,
+    pub h_c: f32,
+    /// Patch radius (a patch is `2 · half + 1` cells on a side) of the first and of the later passes.
+    pub half: usize,
+    pub half2: usize,
+    /// How much looser (a multiple of the threshold) the average is that cells with few matching patches lean on in
+    /// the first pass; 0 turns it off.
+    pub loose: f32,
+    /// The matched weight below which they lean on it, in a heavily noisy photo (scaled down with the noise).
+    pub few: f32,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
-        Tuning { search: 3, search2: 5, h_light: 0.3, h_heavy: 0.9, h2: 0.12, light: 0.03, heavy: 0.14 }
+        Tuning {
+            search: 3,
+            search2: 5,
+            h_light: 0.3,
+            h_heavy: 0.45,
+            h2: 0.1,
+            light: 0.03,
+            heavy: 0.14,
+            search_c: 7,
+            h_c: 1.0,
+            half: 1,
+            half2: 1,
+            loose: 4.0,
+            few: 0.6,
+        }
     }
 }
 
@@ -117,21 +143,40 @@ fn padded(src: &[f32], t: usize, pad: usize) -> Vec<f32> {
     out
 }
 
-/// One pass: every cell becomes the weighted average of the cells within `radius` whose 3 × 3 patch, over all planes,
-/// is like its own. `guide` holds the planes the patches are compared on, `data` the planes that are averaged
-/// (the same ones in the first pass). Weights are `exp(-(excess) / h)`, `excess` being how far the mean squared
-/// difference of the patches is above `floor` (what two noisy views of one signal give).
-fn pass(guide: &[Vec<f32>], data: &[Vec<f32>], t: usize, radius: usize, h: f32, floor: f32) -> Vec<Vec<f32>> {
-    let pad = radius + 1;
+/// What one [`pass`] is run with.
+#[derive(Clone, Copy)]
+struct Pass {
+    /// Search window radius and patch radius, in cells.
+    radius: usize,
+    half: usize,
+    /// The threshold and the floor of the weights (see [`pass`]).
+    h: f32,
+    floor: f32,
+    /// A second, looser average (threshold `h · loose`) that cells with few matches lean on, so a cell no patch
+    /// resembles is not left as it was; 0 turns it off.
+    loose: f32,
+    /// Matched weight below which a cell starts to lean on that looser average.
+    few: f32,
+}
+
+/// One pass: every cell becomes the weighted average of the cells within `radius` whose patch (`2 · half + 1` cells
+/// on a side), over all planes, is like its own. `guide` holds the planes the patches are compared on, `data` the
+/// planes that are averaged (the same ones in the first pass). Weights are `exp(-(excess) / h)`, `excess` being how
+/// far the mean squared difference of the patches is above `floor` (what two noisy views of one signal give).
+fn pass(guide: &[Vec<f32>], data: &[Vec<f32>], t: usize, p: &Pass) -> Vec<Vec<f32>> {
+    let Pass { radius, half, h, floor, loose, few } = *p;
+    let pad = radius + half;
     let wd = t + 2 * pad;
     let guide: Vec<Vec<f32>> = guide.iter().map(|p| padded(p, t, pad)).collect();
     let data: Vec<Vec<f32>> = data.iter().map(|p| padded(p, t, pad)).collect();
-    let (n, region) = (t * t, t + 2);
+    let (n, region, span) = (t * t, t + 2 * half, 2 * half + 1);
     let planes = data.len().max(1);
     let mut num = vec![vec![0f32; n]; planes];
     let mut den = vec![0f32; n];
+    let mut num_l = vec![vec![0f32; n]; if loose > 0.0 { planes } else { 0 }];
+    let mut den_l = vec![0f32; if loose > 0.0 { n } else { 0 }];
     let (mut d, mut rows) = (vec![0f32; region * region], vec![0f32; region * t]);
-    let norm = 1.0 / (9.0 * guide.len().max(1) as f32);
+    let norm = 1.0 / ((span * span) as f32 * guide.len().max(1) as f32);
     let r = radius as isize;
     for oy in -r..=r {
         for ox in -r..=r {
@@ -139,9 +184,9 @@ fn pass(guide: &[Vec<f32>], data: &[Vec<f32>], t: usize, radius: usize, h: f32, 
                 continue;
             }
             let shift = oy * wd as isize + ox;
-            // squared differences over the planes, for the cells and one ring round them
+            // squared differences over the planes, for the cells and the ring round them the patch reaches
             for j in 0..region {
-                let base = (j + pad - 1) * wd + pad - 1;
+                let base = (j + pad - half) * wd + pad - half;
                 for i in 0..region {
                     let pos = base + i;
                     let other = (pos as isize + shift) as usize;
@@ -155,11 +200,11 @@ fn pass(guide: &[Vec<f32>], data: &[Vec<f32>], t: usize, radius: usize, h: f32, 
                     }
                 }
             }
-            // the sum over each cell's 3 × 3 patch: along rows, then down columns
+            // the sum over each cell's patch: along rows, then down columns
             for j in 0..region {
                 for x in 0..t {
                     let k = j * region + x;
-                    let s = d.get(k).copied().unwrap_or(0.0) + d.get(k + 1).copied().unwrap_or(0.0) + d.get(k + 2).copied().unwrap_or(0.0);
+                    let s: f32 = (0..span).map(|i| d.get(k + i).copied().unwrap_or(0.0)).sum();
                     if let Some(v) = rows.get_mut(j * t + x) {
                         *v = s;
                     }
@@ -168,18 +213,35 @@ fn pass(guide: &[Vec<f32>], data: &[Vec<f32>], t: usize, radius: usize, h: f32, 
             for y in 0..t {
                 for x in 0..t {
                     let k = y * t + x;
-                    let patch =
-                        (rows.get(k).copied().unwrap_or(0.0) + rows.get(k + t).copied().unwrap_or(0.0) + rows.get(k + 2 * t).copied().unwrap_or(0.0))
-                            * norm;
-                    let w = (-((patch - floor).max(0.0)) / h).exp();
+                    let patch = (0..span).map(|j| rows.get(k + j * t).copied().unwrap_or(0.0)).sum::<f32>() * norm;
+                    let excess = (patch - floor).max(0.0);
+                    let wide = if loose > 0.0 { loose } else { 1.0 };
+                    // beyond this the weight is below 5e-5: not worth the exponential and the sums
+                    if excess > 10.0 * h * wide {
+                        continue;
+                    }
                     let pos = (y + pad) * wd + x + pad;
                     let other = (pos as isize + shift) as usize;
-                    if let Some(dn) = den.get_mut(k) {
-                        *dn += w;
+                    if excess <= 10.0 * h {
+                        let w = (-excess / h).exp();
+                        if let Some(dn) = den.get_mut(k) {
+                            *dn += w;
+                        }
+                        for (nu, p) in num.iter_mut().zip(&data) {
+                            if let (Some(nu), Some(v)) = (nu.get_mut(k), p.get(other)) {
+                                *nu += w * v;
+                            }
+                        }
                     }
-                    for (nu, p) in num.iter_mut().zip(&data) {
-                        if let (Some(nu), Some(v)) = (nu.get_mut(k), p.get(other)) {
-                            *nu += w * v;
+                    if loose > 0.0 {
+                        let w = (-excess / (h * loose)).exp();
+                        if let Some(dn) = den_l.get_mut(k) {
+                            *dn += w;
+                        }
+                        for (nu, p) in num_l.iter_mut().zip(&data) {
+                            if let (Some(nu), Some(v)) = (nu.get_mut(k), p.get(other)) {
+                                *nu += w * v;
+                            }
                         }
                     }
                 }
@@ -188,11 +250,19 @@ fn pass(guide: &[Vec<f32>], data: &[Vec<f32>], t: usize, radius: usize, h: f32, 
     }
     // the cell itself counts as much as a perfect match
     let mut out = vec![vec![0f32; n]; planes];
-    for (o, (nu, p)) in out.iter_mut().zip(num.iter().zip(&data)) {
+    for (c, (o, (nu, p))) in out.iter_mut().zip(num.iter().zip(&data)).enumerate() {
         for k in 0..n {
             let own = p.get((k / t + pad) * wd + k % t + pad).copied().unwrap_or(0.0);
             if let (Some(o), Some(nu), Some(dn)) = (o.get_mut(k), nu.get(k), den.get(k)) {
-                *o = (nu + own) / (dn + 1.0);
+                let tight = (nu + own) / (dn + 1.0);
+                *o = match (num_l.get(c).and_then(|v| v.get(k)), den_l.get(k)) {
+                    (Some(nl), Some(dl)) => {
+                        let loose = (nl + own) / (dl + 1.0);
+                        let lean = if few > 0.0 { few / (dn + few) } else { 0.0 };
+                        tight + (loose - tight) * lean
+                    }
+                    _ => tight,
+                };
             }
         }
     }
@@ -205,14 +275,30 @@ pub fn filter(planes: &[Vec<f32>], t: usize, tune: &Tuning, noise: f32) -> Vec<V
     let y = hadamard(planes);
     let k = tune.strength(if noise.is_finite() { noise } else { 0.0 });
     // two noisy views of one signal differ by 2 in mean square: the floor the excess is counted from
-    let first = pass(&y, &y, t, tune.search, tune.h_light + (tune.h_heavy - tune.h_light) * k, 2.0);
+    let h1 = tune.h_light + (tune.h_heavy - tune.h_light) * k;
+    let first = pass(&y, &y, t, &Pass { radius: tune.search, half: tune.half, h: h1, floor: 2.0, loose: tune.loose, few: tune.few * k });
     if tune.search2 == 0 || k <= 0.0 {
         return hadamard(&first);
     }
     // the first pass's picture still carries a little noise (of unknown size), so the floor is 0 and the threshold
     // alone decides
-    let second = pass(&first, &y, t, tune.search2, tune.h2, 0.0);
-    let blended: Vec<Vec<f32>> = first.iter().zip(&second).map(|(f, s)| f.iter().zip(s).map(|(f, s)| f + (s - f) * k).collect()).collect();
+    let second = pass(&first, &y, t, &Pass { radius: tune.search2, half: tune.half2, h: tune.h2, floor: 0.0, loose: 0.0, few: 0.0 });
+    let mut blended: Vec<Vec<f32>> = first.iter().zip(&second).map(|(f, s)| f.iter().zip(s).map(|(f, s)| f + (s - f) * k).collect()).collect();
+    if tune.search_c > 0 {
+        // matches found on the cleaned brightness plane alone, so colour is only averaged across like brightness
+        let guide = blended.get(..1).unwrap_or_default();
+        let colour = pass(
+            guide,
+            y.get(1..).unwrap_or_default(),
+            t,
+            &Pass { radius: tune.search_c, half: tune.half2, h: tune.h_c, floor: 0.0, loose: 0.0, few: 0.0 },
+        );
+        for (b, c) in blended.iter_mut().skip(1).zip(&colour) {
+            for (b, c) in b.iter_mut().zip(c) {
+                *b += (c - *b) * k;
+            }
+        }
+    }
     hadamard(&blended)
 }
 
@@ -246,5 +332,71 @@ mod tests {
         }
         let energy = |p: &[Vec<f32>]| p.iter().flatten().map(|v| v * v).sum::<f32>();
         assert!((energy(&planes) - energy(&hadamard(&planes))).abs() < 1e-2);
+    }
+
+    /// Four planes of unit noise (an LCG and Box-Muller, so the tests need no dependency) round `level`.
+    fn noisy(t: usize, level: f32, seed: u64) -> Vec<Vec<f32>> {
+        let mut state = seed;
+        let mut uniform = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 + 0.5) / (1u64 << 24) as f32
+        };
+        (0..4)
+            .map(|_| {
+                (0..t * t)
+                    .map(|_| {
+                        let (u, v) = (uniform(), uniform());
+                        level + (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn spread(planes: &[Vec<f32>], level: f32) -> f32 {
+        let all: Vec<f32> = planes.iter().flatten().copied().collect();
+        (all.iter().map(|v| (v - level) * (v - level)).sum::<f32>() / all.len().max(1) as f32).sqrt()
+    }
+
+    #[test]
+    fn the_colour_pass_cleans_colour_planes_further_than_brightness_alone_would() {
+        let (t, noise) = (40, 0.2);
+        let planes = noisy(t, 5.0, 3);
+        let with = filter(&planes, t, &Tuning::default(), noise);
+        let without = filter(&planes, t, &Tuning { search_c: 0, ..Tuning::default() }, noise);
+        // after the Hadamard rotation the colour differences are planes 1..4 of the mixed result, so compare it all
+        assert!(spread(&with, 5.0) < spread(&without, 5.0), "{} vs {}", spread(&with, 5.0), spread(&without, 5.0));
+        assert!(spread(&with, 5.0) < 0.5, "unit noise should drop well below 0.5: {}", spread(&with, 5.0));
+    }
+
+    #[test]
+    fn a_cell_no_patch_resembles_is_not_left_as_a_speck_in_heavy_noise() {
+        let (t, noise) = (40, 0.2);
+        let mut planes = noisy(t, 5.0, 9);
+        // one cell far from its surroundings in every plane: nothing matches it
+        let at = (t / 2) * t + t / 2;
+        for p in &mut planes {
+            if let Some(v) = p.get_mut(at) {
+                *v += 6.0;
+            }
+        }
+        let with = filter(&planes, t, &Tuning::default(), noise);
+        let without = filter(&planes, t, &Tuning { loose: 0.0, ..Tuning::default() }, noise);
+        let peak = |planes: &[Vec<f32>]| planes.iter().filter_map(|p| p.get(at)).map(|v| (v - 5.0).abs()).fold(0f32, f32::max);
+        assert!(peak(&with) < peak(&without), "{} vs {}", peak(&with), peak(&without));
+    }
+
+    #[test]
+    fn a_photo_with_no_measured_noise_stays_finite_even_with_an_odd_cell() {
+        let t = 24;
+        let mut planes = noisy(t, 5.0, 5);
+        for p in &mut planes {
+            if let Some(v) = p.get_mut(t * t / 2) {
+                *v += 50.0;
+            }
+        }
+        for noise in [0.0, f32::NAN, 1e-9] {
+            assert!(filter(&planes, t, &Tuning::default(), noise).iter().flatten().all(|v| v.is_finite()), "noise {noise}");
+        }
     }
 }

@@ -15,8 +15,11 @@ a · signal + b), turns the noise into unit variance with a variance-stabilising
 and cleans the four Bayer planes together with a non-local-means filter: matches are judged
 on all planes at once, so colour noise is cleaned with the brightness. It cleans gently
 at low noise (to keep fine detail) and harder, with a second pass that finds matches on
-the first pass's cleaner picture, as the noise grows. It then demosaics with edge-directed
-green and colour-difference red and blue. It is written for
+the first pass's cleaner picture, as the noise grows. The three colour-difference planes then get a
+wider pass of their own, guided by the cleaned brightness plane, so colour noise is removed
+further than brightness noise without smearing texture; in heavy noise, a cell that no patch
+resembles leans on a looser average instead of staying as a speck. It then demosaics with
+edge-directed green and colour-difference red and blue. It is written for
 LightCraft, pure Rust, MIT OR Apache-2.0, has no weights and no download, and uses the
 same tiling, cache, queue, preview and export path as a model. Its tile is 256 cells with a
 16-cell overlap; it runs on the processor (the GPU setting does not apply to it). A change
@@ -27,7 +30,11 @@ trained network, so a good model can still do better on very noisy files.
 To measure a change to it, run the opt-in benchmark on a public CC0 raw (see `cargo xtask corpus`):
 `LC_DENOISE_RAW=corpus/raw/arw-sony-a7m3-compressed.arw LC_DENOISE_OUT=/tmp/dn cargo test --release -p lightcraft-engine --test denoise_builtin_quality -- --ignored --nocapture`.
 It adds noise of four known levels to the raw, runs the denoiser and prints the PSNR against the
-original; `LC_DENOISE_OUT` also writes truth | noisy | denoised PNGs. Use public files only.
+original, plus a texture figure (how much of the true picture's fine structure the result keeps; noise
+can't inflate it); `LC_DENOISE_OUT` also writes truth | noisy | denoised PNGs. Use public files only.
+`LC_S1`, `LC_S2`, `LC_HL`, `LC_HH`, `LC_H2`, `LC_LIGHT`, `LC_HEAVY`, `LC_SC`, `LC_HC`, `LC_P1`, `LC_P2`,
+`LC_LOOSE` and `LC_FEW` override the matching `nlm::Tuning` field for a sweep. PSNR and texture trade off
+(smoothing more raises one and lowers the other), so judge a change on both and on the crops.
 
 ## Models and terms (optional)
 

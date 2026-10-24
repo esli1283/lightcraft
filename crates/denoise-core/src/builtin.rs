@@ -16,7 +16,7 @@ use crate::run::{Error, TileRunner};
 /// Id of the built-in denoiser; no installed model may use it (the models folder is never searched for it).
 pub const ID: &str = "builtin";
 /// Changes when the algorithm does, so that cached pictures made by an older one are made again.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Side of its tile, in cells.
 pub const TILE: u32 = 256;
 /// Cells neighbouring tiles share.

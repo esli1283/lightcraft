@@ -90,6 +90,29 @@ fn gradient(a: &[[f32; 3]], w: usize, h: usize, scale: f32) -> f64 {
     sum
 }
 
+/// How much of the true picture's fine structure the result keeps: the slope of the result's high-pass (green minus
+/// its 5 x 5 mean) against the truth's. Noise is independent of the truth, so unlike gradient energy it can't inflate it.
+fn texture(a: &[[f32; 3]], truth: &[[f32; 3]], w: usize, h: usize, scale: f32) -> f64 {
+    let hp = |p: &[[f32; 3]], x: usize, y: usize| {
+        let mut m = 0f64;
+        for j in 0..5 {
+            for i in 0..5 {
+                m += f64::from(gamma(p[(y + j - 2) * w + x + i - 2][1] * scale));
+            }
+        }
+        f64::from(gamma(p[y * w + x][1] * scale)) - m / 25.0
+    };
+    let (mut xy, mut xx) = (0f64, 0f64);
+    for y in 16..h - 16 {
+        for x in 16..w - 16 {
+            let t = hp(truth, x, y);
+            xy += t * hp(a, x, y);
+            xx += t * t;
+        }
+    }
+    xy / xx
+}
+
 fn crop_rgb8(a: &[[f32; 3]], w: usize, (x0, y0): (usize, usize), side: usize, scale: f32) -> Vec<u8> {
     let wb = [2.0f32, 1.0, 1.6];
     let mut out = Vec::with_capacity(side * side * 3);
@@ -120,7 +143,7 @@ fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
     let scale = (0.18 / mean) as f32;
     let truth_rgb = plain(&truth, w, h);
     println!("{path}: {}x{}, window {w}x{h}, mean {mean:.4}", n.width, n.height);
-    println!("{:<14}{:>10}{:>10}{:>9}{:>9}{:>9}", "noise (a, b)", "noisy dB", "denoised", "gain", "detail", "seconds");
+    println!("{:<14}{:>10}{:>10}{:>9}{:>9}{:>9}{:>9}", "noise (a, b)", "noisy dB", "denoised", "gain", "detail", "texture", "seconds");
     let out_dir = std::env::var("LC_DENOISE_OUT").ok();
     for (name, a, b) in [("light", 0.002f32, 0.0002f32), ("medium", 0.008, 0.001), ("heavy", 0.025, 0.004), ("extreme", 0.06, 0.012)] {
         let mut rng = Rng(11);
@@ -134,19 +157,24 @@ fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
         (tuning.h_light, tuning.h_heavy, tuning.h2) =
             (env("LC_HL").unwrap_or(tuning.h_light), env("LC_HH").unwrap_or(tuning.h_heavy), env("LC_H2").unwrap_or(tuning.h2));
         (tuning.light, tuning.heavy) = (env("LC_LIGHT").unwrap_or(tuning.light), env("LC_HEAVY").unwrap_or(tuning.heavy));
+        (tuning.half, tuning.half2) = (env("LC_P1").map_or(tuning.half, |v| v as usize), env("LC_P2").map_or(tuning.half2, |v| v as usize));
+        (tuning.loose, tuning.few) = (env("LC_LOOSE").unwrap_or(tuning.loose), env("LC_FEW").unwrap_or(tuning.few));
+        (tuning.search_c, tuning.h_c) = (env("LC_SC").map_or(tuning.search_c, |v| v as usize), env("LC_HC").unwrap_or(tuning.h_c));
         let runner = Builtin { noise: Some(est), tuning };
         let out = denoise_bayer(&noisy, w, h, layout, &runner, &params, &Control::default()).unwrap();
         let secs = started.elapsed().as_secs_f64();
         let noisy_rgb = plain(&noisy, w, h);
         let (p_noisy, p_out) = (psnr(&noisy_rgb, &truth_rgb, w, h, scale), psnr(&out.data, &truth_rgb, w, h, scale));
         let detail = gradient(&out.data, w, h, scale) / gradient(&truth_rgb, w, h, scale);
+        let tex = texture(&out.data, &truth_rgb, w, h, scale);
         println!(
-            "{:<14}{:>10.2}{:>10.2}{:>+9.2}{:>9.3}{:>9.2}   noise a {:.4} (true {a}), b {:.5} (true {b})",
+            "{:<14}{:>10.2}{:>10.2}{:>+9.2}{:>9.3}{:>9.3}{:>9.2}   noise a {:.4} (true {a}), b {:.5} (true {b})",
             name,
             p_noisy,
             p_out,
             p_out - p_noisy,
             detail,
+            tex,
             secs,
             est.0,
             est.1

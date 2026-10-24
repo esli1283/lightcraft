@@ -8,8 +8,10 @@
   Stop using returns to the built-in one. The set-up prompt and its "resume after installing" flow are gone. See
   [AI Denoise](denoise.md).
 - The built-in denoiser measures the photo's noise once, cleans the four colour planes together on variance-stabilised
-  data (so colour blotches go too), and cleans harder, with a second pass, the noisier the photo is. On a public raw with
-  added noise it scores 3.6 to 9.7 dB higher than the noisy picture, the most at heavy noise.
+  data (so colour blotches go too), and cleans harder, with a second pass, the noisier the photo is. Colour noise gets
+  a wider pass of its own, and in heavy noise isolated specks are smoothed away. On a public raw with added noise it
+  scores 3.7 to 10.4 dB higher than the noisy picture, the most at heavy noise, and keeps more fine texture there
+  than before (heavy noise: 22 % of it against 20 %; extreme: 9 % against 7 %).
 
 ### Tab leaves the name field in New Album, New Smart Album and the name prompts
 - In New Album, New Smart Album, Save Metadata Preset and the other dialogs with one name field, the field has the
