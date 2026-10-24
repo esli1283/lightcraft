@@ -24,6 +24,11 @@ to the algorithm bumps `builtin::VERSION`, so cached pictures are made again. Th
 `builtin` is reserved: a model with that id is refused. It is a classical filter, not a
 trained network, so a good model can still do better on very noisy files.
 
+To measure a change to it, run the opt-in benchmark on a public CC0 raw (see `cargo xtask corpus`):
+`LC_DENOISE_RAW=corpus/raw/arw-sony-a7m3-compressed.arw LC_DENOISE_OUT=/tmp/dn cargo test --release -p lightcraft-engine --test denoise_builtin_quality -- --ignored --nocapture`.
+It adds noise of four known levels to the raw, runs the denoiser and prints the PSNR against the
+original; `LC_DENOISE_OUT` also writes truth | noisy | denoised PNGs. Use public files only.
+
 ## Models and terms (optional)
 
 **No model weights are bundled.** Choosing a model replaces the built-in denoiser; **Stop using**
