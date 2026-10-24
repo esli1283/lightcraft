@@ -1,5 +1,17 @@
 # What's new in LightCraft
 
+## 2026-10-24
+
+### Better built-in AI Denoise
+- The built-in denoiser now cleans with block-matching collaborative filtering: similar blocks of the picture are
+  grouped, transformed together and thresholded, so more fine detail survives at the same level of cleaning. On a
+  public raw with added noise it scores 0.25 to 0.6 dB higher than before at every noise level and keeps more
+  texture at medium to extreme noise (medium: 44 % of it against 42 %; extreme: 12 % against 9 %), a little less at
+  light noise (58 % against 62 %), with no colour blotches or   isolated specks. It is as fast as the old filter on the processor, and when the computer has a graphics card that is faster
+  it runs there: on an RTX 4080 SUPER a photo's tiles go about 6 to 10 times faster, with the same picture (Settings ▸ AI
+  Denoise ▸ Run on chooses; Automatic times both). Photos
+  denoised before are denoised again the next time they are needed. See [AI Denoise](denoise.md).
+
 ## 2026-10-23
 
 ### AI Denoise works out of the box

@@ -41,6 +41,9 @@ pub struct Tuning {
     pub loose: f32,
     /// The matched weight below which they lean on it, in a heavily noisy photo (scaled down with the noise).
     pub few: f32,
+    /// Block-matching collaborative filtering ([`crate::bm3d`]) is what cleans the planes; with `None` the non-local-means
+    /// averages above do (their settings apply only then).
+    pub bm3d: Option<crate::bm3d::Params>,
 }
 
 impl Default for Tuning {
@@ -59,6 +62,7 @@ impl Default for Tuning {
             half2: 1,
             loose: 4.0,
             few: 0.6,
+            bm3d: Some(crate::bm3d::Params::default()),
         }
     }
 }

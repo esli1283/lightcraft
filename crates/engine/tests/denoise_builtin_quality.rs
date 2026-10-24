@@ -145,6 +145,13 @@ fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
     println!("{path}: {}x{}, window {w}x{h}, mean {mean:.4}", n.width, n.height);
     println!("{:<14}{:>10}{:>10}{:>9}{:>9}{:>9}{:>9}", "noise (a, b)", "noisy dB", "denoised", "gain", "detail", "texture", "seconds");
     let out_dir = std::env::var("LC_DENOISE_OUT").ok();
+    #[cfg(feature = "denoise")]
+    let gpu = std::env::var("LC_GPU").is_ok_and(|v| v != "0").then(|| {
+        let p = Tuning::default().bm3d.unwrap();
+        let g = lightcraft_gpu::bm3d::Bm3dGpu::new(&p, TILE as usize).unwrap();
+        println!("on the graphics card: {} ({})", g.adapter(), g.build_report());
+        std::sync::Arc::new(g)
+    });
     for (name, a, b) in [("light", 0.002f32, 0.0002f32), ("medium", 0.008, 0.001), ("heavy", 0.025, 0.004), ("extreme", 0.06, 0.012)] {
         let mut rng = Rng(11);
         let noisy: Vec<f32> = truth.iter().map(|&v| v + rng.normal() * (a * v.max(0.0) + b).sqrt()).collect();
@@ -160,7 +167,33 @@ fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
         (tuning.half, tuning.half2) = (env("LC_P1").map_or(tuning.half, |v| v as usize), env("LC_P2").map_or(tuning.half2, |v| v as usize));
         (tuning.loose, tuning.few) = (env("LC_LOOSE").unwrap_or(tuning.loose), env("LC_FEW").unwrap_or(tuning.few));
         (tuning.search_c, tuning.h_c) = (env("LC_SC").map_or(tuning.search_c, |v| v as usize), env("LC_HC").unwrap_or(tuning.h_c));
+        // LC_NLM=1 runs the old non-local-means filter instead; LC_B_* override the block-matching filter's parameters
+        if env("LC_NLM").is_some_and(|v| v > 0.0) {
+            tuning.bm3d = None;
+        }
+        if let Some(b) = tuning.bm3d.as_mut() {
+            (b.block, b.step, b.search, b.group) = (
+                env("LC_B_N").map_or(b.block, |v| v as usize),
+                env("LC_B_STEP").map_or(b.step, |v| v as usize),
+                env("LC_B_S").map_or(b.search, |v| v as usize),
+                env("LC_B_K").map_or(b.group, |v| v as usize),
+            );
+            (b.tau1, b.tau2) = (env("LC_B_T1").unwrap_or(b.tau1), env("LC_B_T2").unwrap_or(b.tau2));
+            (b.lambda, b.lambda_heavy, b.sigma) =
+                (env("LC_B_L").unwrap_or(b.lambda), env("LC_B_LH").unwrap_or(b.lambda_heavy), env("LC_B_SIG").unwrap_or(b.sigma));
+            b.wiener = env("LC_B_WIENER").is_none_or(|v| v > 0.0);
+        }
         let runner = Builtin { noise: Some(est), tuning };
+        // LC_GPU=1 (with `--features denoise`) runs the block-matching filter on the graphics card
+        #[cfg(feature = "denoise")]
+        let out = match &gpu {
+            Some(g) => {
+                let on_card = lightcraft_gpu::bm3d::BuiltinRunner::new(g.clone(), runner).unwrap();
+                denoise_bayer(&noisy, w, h, layout, &on_card, &params, &Control::default()).unwrap()
+            }
+            None => denoise_bayer(&noisy, w, h, layout, &runner, &params, &Control::default()).unwrap(),
+        };
+        #[cfg(not(feature = "denoise"))]
         let out = denoise_bayer(&noisy, w, h, layout, &runner, &params, &Control::default()).unwrap();
         let secs = started.elapsed().as_secs_f64();
         let noisy_rgb = plain(&noisy, w, h);

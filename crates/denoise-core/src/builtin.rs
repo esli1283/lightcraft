@@ -3,9 +3,9 @@
 //! It is a [`TileRunner`] with the same contract as a model (four Bayer planes in, camera RGB at twice the plane
 //! size out), written from scratch and needing no file: the noise level of the photo is measured from the photo itself
 //! (Poisson-Gaussian: variance = a · signal + b; [`estimate_noise`], with a tile's own measure as the fallback), the
-//! four planes are cleaned together by a non-local-means filter on variance-stabilised data ([`crate::nlm`]), which
-//! cleans harder and in a second pass as the noise grows, and the cleaned mosaic is demosaiced with edge-directed
-//! green and colour-difference red and blue.
+//! four planes are cleaned together by block-matching collaborative filtering on variance-stabilised data
+//! ([`crate::bm3d`]; the non-local-means filter of [`crate::nlm`] is the fallback), which cleans harder as the noise
+//! grows, and the cleaned mosaic is demosaiced with edge-directed green and colour-difference red and blue.
 
 use crate::bayer::reflect;
 use crate::licence::{Commercial, Licence};
@@ -16,7 +16,7 @@ use crate::run::{Error, TileRunner};
 /// Id of the built-in denoiser; no installed model may use it (the models folder is never searched for it).
 pub const ID: &str = "builtin";
 /// Changes when the algorithm does, so that cached pictures made by an older one are made again.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// Side of its tile, in cells.
 pub const TILE: u32 = 256;
 /// Cells neighbouring tiles share.
@@ -44,7 +44,7 @@ pub fn manifest() -> DenoiserManifest {
         source: None,
         sha256: None,
         size_bytes: None,
-        provenance: "Non-local-means filtering with a noise level measured from each photo, written for LightCraft.".into(),
+        provenance: "Block-matching collaborative filtering with a noise level measured from each photo, written for LightCraft.".into(),
         domain: Domain::BayerToRgb,
         tile: TILE,
         overlap: OVERLAP,
@@ -65,10 +65,18 @@ impl Builtin {
     pub fn with_noise(noise: (f32, f32)) -> Self {
         Builtin { noise: Some(noise), tuning: Tuning::default() }
     }
-}
 
-impl TileRunner for Builtin {
-    fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
+    /// The block-matching filter's parameters when this one uses it (the only filter with a graphics-card version, see
+    /// `lightcraft_gpu::bm3d`), else `None`.
+    pub fn bm3d_params(&self) -> Option<crate::bm3d::Params> {
+        self.tuning.bm3d
+    }
+
+    /// [`TileRunner::run`] with the filter stage given: it gets the four variance-stabilised planes (unit noise), their
+    /// side, and the photo's noise at mid-grey (which sets how strongly to clean, see [`Tuning::strength`]), and returns
+    /// the cleaned planes. Everything else (measuring the noise, stabilising and its inverse, demosaicing) is shared, so
+    /// a filter that is the same computation on another device gives the same picture.
+    pub fn run_with(&self, input: &[f32], filter: &dyn Fn(&[Vec<f32>], usize, f32) -> Result<Vec<Vec<f32>>, Error>) -> Result<Vec<f32>, Error> {
         let t = side_of(input.len()).ok_or_else(|| Error::Input("the tile is not four square planes".into()))?;
         let clean: Vec<f32> = input.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect();
         let n = t * t;
@@ -78,9 +86,26 @@ impl TileRunner for Builtin {
         };
         let st = Stabiliser::new(a, b);
         let stabilised: Vec<Vec<f32>> = clean.chunks_exact(n).map(|p| p.iter().map(|&v| st.forward(v)).collect()).collect();
-        let cleaned = nlm::filter(&stabilised, t, &self.tuning, (a * 0.18 + b).max(0.0).sqrt());
+        let cleaned = filter(&stabilised, t, (a * 0.18 + b).max(0.0).sqrt())?;
+        if cleaned.len() != 4 || cleaned.iter().any(|p| p.len() != n) {
+            return Err(Error::Runtime("the filter returned planes of the wrong size".into()));
+        }
         let planes: Vec<Vec<f32>> = cleaned.iter().map(|p| p.iter().map(|&v| st.inverse(v)).collect()).collect();
         Ok(demosaic(&planes, t))
+    }
+
+    /// The filter stage on the processor.
+    pub fn filter_on_cpu(&self, stabilised: &[Vec<f32>], t: usize, noise: f32) -> Vec<Vec<f32>> {
+        match &self.tuning.bm3d {
+            Some(p) => crate::bm3d::filter(stabilised, t, p, self.tuning.strength(noise)),
+            None => nlm::filter(stabilised, t, &self.tuning, noise),
+        }
+    }
+}
+
+impl TileRunner for Builtin {
+    fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
+        self.run_with(input, &|planes, t, noise| Ok(self.filter_on_cpu(planes, t, noise)))
     }
 }
 
@@ -437,8 +462,10 @@ mod tests {
             assert!(out.iter().all(|v| v.is_finite()), "{bad:?}");
         }
         // no search at all is a plain demosaic, not a crash
-        let none = Builtin { noise: Some((0.01, 1e-3)), tuning: Tuning { search: 0, search2: 0, ..Tuning::default() } };
+        let none = Builtin { noise: Some((0.01, 1e-3)), tuning: Tuning { search: 0, search2: 0, bm3d: None, ..Tuning::default() } };
         assert!(none.run(&input).unwrap().iter().all(|v| v.is_finite()));
+        let nlm = Builtin { noise: Some((0.01, 1e-3)), tuning: Tuning { bm3d: None, ..Tuning::default() } };
+        assert!(nlm.run(&input).unwrap().iter().all(|v| v.is_finite()));
         let tune = Tuning::default();
         let ramp: Vec<f32> = [0.0, 0.02, 0.05, 0.1, 0.2].iter().map(|&n| tune.strength(n)).collect();
         assert!(ramp.windows(2).all(|w| w[0] <= w[1]) && ramp[0] == 0.0 && ramp[4] == 1.0, "{ramp:?}");
