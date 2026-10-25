@@ -268,9 +268,12 @@ impl Bm3dGpu {
 
     /// A workspace is gone (dropped after a failure): room for a new one, and a waiting caller may make it.
     fn forget(&self) {
+        // under `free`, as `take` is when it reads `made` and goes to wait: a wake-up sent between the two would be lost
+        let free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         *made = made.saturating_sub(1);
         drop(made);
+        drop(free);
         self.wake.notify_one();
     }
 
@@ -513,6 +516,23 @@ mod tests {
             assert!(got.iter().flatten().all(|v| v.is_finite()));
             assert!(mean < 1e-3 && worst < 0.1, "tile {t}: the GPU is off by {worst:e} at most and {mean:e} on average");
         }
+    }
+
+    /// `forget` must change `made` under the `free` lock: a waiting `take` holds it from reading `made` until it sleeps, so
+    /// a slot given up in between cannot be announced to nobody (the waiter would sleep on a free slot for good).
+    #[test]
+    fn forgetting_a_workspace_waits_for_a_taker_that_is_about_to_sleep() {
+        let Some(g) = gpu(&Params::default(), 32) else { return };
+        let g = Arc::new(g);
+        let before = *g.made.lock().unwrap();
+        let held = g.free.lock().unwrap();
+        let other = g.clone();
+        let forgetter = std::thread::spawn(move || other.forget());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(*g.made.lock().unwrap(), before, "forget changed the count while a taker held the free list");
+        drop(held);
+        forgetter.join().unwrap();
+        assert_eq!(*g.made.lock().unwrap(), before.saturating_sub(1));
     }
 
     #[test]

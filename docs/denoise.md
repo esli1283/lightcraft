@@ -42,8 +42,8 @@ non-local-means filter (`crates/denoise-core/src/nlm.rs`) is still there as a fa
 (`Tuning::bm3d = None`). Why block matching and not something else: see [Why block matching](#why-block-matching).
 
 To measure a change to it, run the opt-in benchmark on a public CC0 raw (see `cargo xtask corpus`):
-`LC_DENOISE_RAW=corpus/raw/arw-sony-a7m3-compressed.arw LC_DENOISE_OUT=/tmp/dn cargo test --release -p lightcraft-engine --test denoise_builtin_quality -- --ignored --nocapture`
-(use an absolute path: tests run from the crate's folder).
+`LC_DENOISE_RAW="$(git rev-parse --show-toplevel)/corpus/raw/arw-sony-a7m3-compressed.arw" LC_DENOISE_OUT=/tmp/dn cargo test --release -p lightcraft-engine --test denoise_builtin_quality -- --ignored --nocapture`
+(the path must be absolute: tests run from the crate's folder).
 It adds noise of four known levels to the raw, runs the denoiser and prints the PSNR against the
 original, plus a texture figure (how much of the true picture's fine structure the result keeps; noise
 can't inflate it); `LC_DENOISE_OUT` also writes truth | noisy | denoised PNGs. Use public files only.

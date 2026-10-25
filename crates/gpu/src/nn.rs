@@ -764,9 +764,12 @@ impl NetRunner {
 
     /// A workspace is gone (dropped after a failure): room for a new one, and a waiting caller may make it.
     fn forget(&self) {
+        // under `free`, as `take` is when it reads `made` and goes to wait: a wake-up sent between the two would be lost
+        let free = self.free.lock().unwrap_or_else(|e| e.into_inner());
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         *made = made.saturating_sub(1);
         drop(made);
+        drop(free);
         self.wake.notify_one();
     }
 
@@ -957,6 +960,24 @@ mod tests {
         let Some(g) = gpu(&n, 6) else { return };
         let x: Vec<f32> = (1..=144).map(|i| i as f32).collect();
         assert_eq!(g.run(&x).unwrap(), reference::run(&n, 6, &x).unwrap());
+    }
+
+    /// `forget` must change `made` under the `free` lock: a waiting `take` holds it from reading `made` until it sleeps, so
+    /// a slot given up in between cannot be announced to nobody (the waiter would sleep on a free slot for good).
+    #[test]
+    fn forgetting_a_workspace_waits_for_a_taker_that_is_about_to_sleep() {
+        let n = Net::new(4, vec![copy(0, 12), Op::DepthToSpace2 { src: 1 }]).unwrap();
+        let Some(g) = gpu(&n, 4) else { return };
+        let g = std::sync::Arc::new(g);
+        let before = *g.made.lock().unwrap();
+        let held = g.free.lock().unwrap();
+        let other = g.clone();
+        let forgetter = std::thread::spawn(move || other.forget());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(*g.made.lock().unwrap(), before, "forget changed the count while a taker held the free list");
+        drop(held);
+        forgetter.join().unwrap();
+        assert_eq!(*g.made.lock().unwrap(), before.saturating_sub(1));
     }
 
     #[test]
