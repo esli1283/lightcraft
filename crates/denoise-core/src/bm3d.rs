@@ -27,10 +27,12 @@ pub struct Params {
     /// grouped, in the first step (on the noisy picture) and in the second (on the basic estimate).
     pub tau1: f32,
     pub tau2: f32,
-    /// Hard-threshold level of the first step, in noise deviations, for a light and for a heavily noisy photo (see
-    /// [`crate::nlm::Tuning::strength`]): a lightly noisy photo has more fine detail to keep per unit of noise.
-    pub lambda: f32,
-    pub lambda_heavy: f32,
+    /// The first step's hard-threshold level, in noise deviations, as a function of how noisy the photo is: points of
+    /// (the noise's deviation at mid-grey, with white = 1; the threshold), rising with the noise and joined in a straight
+    /// line against the logarithm of the noise (flat beyond the first and last). A quieter photo has more fine detail
+    /// per unit of noise to keep, a noisier one less. Fitted on real Canon raws with noise added at their ISO levels
+    /// (docs/denoise.md → Why block matching).
+    pub lambda: [(f32, f32); 6],
     /// The noise's deviation as the filter takes it (1 = as measured; more cleans harder).
     pub sigma: f32,
     /// Whether the second (Wiener) step runs.
@@ -39,8 +41,35 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Params { block: 4, step: 3, search: 8, group: 16, tau1: 4.0, tau2: 1.0, lambda: 1.9, lambda_heavy: 3.0, sigma: 1.0, wiener: true }
+        Params {
+            block: 4,
+            step: 3,
+            search: 8,
+            group: 16,
+            tau1: 4.0,
+            tau2: 1.0,
+            lambda: [(0.0028, 1.2), (0.0062, 1.9), (0.0094, 2.3), (0.0152, 2.65), (0.038, 3.2), (0.14, 3.5)],
+            sigma: 1.0,
+            wiener: true,
+        }
     }
+}
+
+/// The threshold for a photo whose noise has deviation `noise` at mid-grey: `curve` read in a straight line against the
+/// logarithm of the noise (the ends hold). A curve that is empty or not rising in its first coordinate gives its first
+/// point's value for any noise, and a noise that is not a number is the quietest.
+pub fn threshold_for(curve: &[(f32, f32)], noise: f32) -> f32 {
+    let Some(&(x0, y0)) = curve.first() else { return 3.0 };
+    if !noise.is_finite() || noise <= x0 {
+        return y0;
+    }
+    for pair in curve.windows(2) {
+        let ((xa, ya), (xb, yb)) = (pair[0], pair[1]);
+        if xa.is_finite() && xb.is_finite() && xa > 0.0 && xb > xa && noise <= xb {
+            return ya + (yb - ya) * (noise / xa).ln() / (xb / xa).ln();
+        }
+    }
+    curve.last().map_or(y0, |p| p.1)
 }
 
 /// The orthonormal DCT-II of a block and the window the filtered blocks are put back with.
@@ -404,16 +433,16 @@ pub struct Plan {
     pub lambda: f32,
 }
 
-/// The parameters as they are used for tiles of `t` cells and a photo of noise `strength` (0 light to 1 heavy), or
-/// `None` when the tiles are smaller than a block (they are then left as they are).
-pub fn plan(p: &Params, t: usize, strength: f32) -> Option<Plan> {
+/// The parameters as they are used for tiles of `t` cells and a photo whose noise has deviation `noise` at mid-grey
+/// (white = 1; see [`Params::lambda`]), or `None` when the tiles are smaller than a block (they are then left as they
+/// are).
+pub fn plan(p: &Params, t: usize, noise: f32) -> Option<Plan> {
     let n = p.block.clamp(2, 16);
     if t < n {
         return None;
     }
     let params = Params { block: n, search: p.search.min(t), group: p.group.clamp(1, 64), ..*p };
-    let k = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 0.0 };
-    Some(Plan { params, lambda: p.lambda + (p.lambda_heavy - p.lambda) * k })
+    Some(Plan { params, lambda: threshold_for(&p.lambda, noise) })
 }
 
 /// The block-to-block DCT matrix (`n × n`, row `k` is frequency `k`) and the window (`n × n`) the filtered blocks are put
@@ -423,11 +452,11 @@ pub fn constants(n: usize) -> (Vec<f32>, Vec<f32>) {
     (tf.c, tf.window)
 }
 
-/// Denoise four unit-noise planes of `t × t` cells (see the module description); `strength` is the photo's noise
-/// from 0 (light) to 1 (heavy), see [`crate::nlm::Tuning::strength`].
-pub fn filter(planes: &[Vec<f32>], t: usize, p: &Params, strength: f32) -> Vec<Vec<f32>> {
+/// Denoise four unit-noise planes of `t × t` cells (see the module description); `noise` is the photo's noise at
+/// mid-grey, which sets how hard it cleans (see [`Params::lambda`]).
+pub fn filter(planes: &[Vec<f32>], t: usize, p: &Params, noise: f32) -> Vec<Vec<f32>> {
     let y = hadamard(planes);
-    let Some(Plan { params: p, lambda }) = plan(p, t, strength) else { return hadamard(&y) };
+    let Some(Plan { params: p, lambda }) = plan(p, t, noise) else { return hadamard(&y) };
     if y.len() != 4 || y.iter().any(|pl| pl.len() != t * t) {
         return hadamard(&y);
     }
@@ -492,6 +521,28 @@ mod tests {
     fn spread(planes: &[Vec<f32>], level: f32) -> f32 {
         let all: Vec<f32> = planes.iter().flatten().copied().collect();
         (all.iter().map(|v| (v - level) * (v - level)).sum::<f32>() / all.len().max(1) as f32).sqrt()
+    }
+
+    #[test]
+    fn the_threshold_follows_the_noise_and_survives_odd_curves() {
+        let c = Params::default().lambda;
+        let at = |n: f32| threshold_for(&c, n);
+        assert_eq!((at(0.0), at(1.0)), (1.2, 3.5), "the ends hold");
+        assert!((at(0.0062) - 1.9).abs() < 1e-4 && (at(0.0152) - 2.65).abs() < 1e-4, "the points are on the curve");
+        let mut last = 0.0;
+        for i in 0..250 {
+            let v = at(0.001 * 1.04f32.powi(i));
+            assert!(v >= last - 1e-6, "the threshold never falls as the noise rises");
+            last = v;
+        }
+        assert_eq!(at(f32::NAN), 1.2, "a noise that is not a number is the quietest");
+        assert_eq!(threshold_for(&[], 0.1), 3.0);
+        // curves that are out of order, or with numbers that are not numbers, give some value and never panic
+        for curve in [vec![(0.0, 1.0), (f32::NAN, 2.0), (0.01, 5.0), (0.005, 4.0)], vec![(0.01, 2.0), (0.01, 3.0)], vec![(-1.0, 2.0), (0.0, 3.0)]] {
+            for n in [0.0, 0.003, 0.02, 1.0, f32::INFINITY] {
+                assert!(threshold_for(&curve, n).is_finite() || !curve.iter().all(|p| p.1.is_finite()));
+            }
+        }
     }
 
     #[test]

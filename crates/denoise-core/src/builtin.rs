@@ -16,7 +16,7 @@ use crate::run::{Error, TileRunner};
 /// Id of the built-in denoiser; no installed model may use it (the models folder is never searched for it).
 pub const ID: &str = "builtin";
 /// Changes when the algorithm does, so that cached pictures made by an older one are made again.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 /// Side of its tile, in cells.
 pub const TILE: u32 = 256;
 /// Cells neighbouring tiles share.
@@ -97,7 +97,7 @@ impl Builtin {
     /// The filter stage on the processor.
     pub fn filter_on_cpu(&self, stabilised: &[Vec<f32>], t: usize, noise: f32) -> Vec<Vec<f32>> {
         match &self.tuning.bm3d {
-            Some(p) => crate::bm3d::filter(stabilised, t, p, self.tuning.strength(noise)),
+            Some(p) => crate::bm3d::filter(stabilised, t, p, noise),
             None => nlm::filter(stabilised, t, &self.tuning, noise),
         }
     }
@@ -151,8 +151,108 @@ fn noise_model(planes: &[&[f32]], t: usize) -> (f32, f32) {
     fit_noise(blocks)
 }
 
-/// The noise of a whole mosaic as `(a, b)` (variance = `a · signal + b`), from blocks spread over the picture.
+/// The noise of a whole mosaic as `(a, b)` (variance = `a · signal + b`), measured from the picture itself.
+///
+/// Each of the four colour planes (they sit at different levels in a raw, so they are never mixed) is cut into blocks.
+/// A block's noise variance is read from a second-difference operator (`[1 -2 1; -2 4 -2; 1 -2 1]`, which cancels flat
+/// and smoothly sloping signal and has `36 σ²` of white noise's variance); texture and edges only add to it. At each
+/// brightness the quietest few blocks are the noise (a low quantile, divided by the bias of that quantile of pure
+/// noise), and a line is fitted through them. A picture with no flat area still reads somewhat high, never low.
 pub fn estimate_noise(mosaic: &[f32], width: usize, height: usize) -> (f32, f32) {
+    estimate_noise_with(mosaic, width, height, &NoiseProbe::default())
+}
+
+/// What [`estimate_noise_with`] may be tuned by.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoiseProbe {
+    /// Cells on a side of the blocks, in a colour plane.
+    pub block: usize,
+    /// Which of a brightness's blocks (by how noisy they look, 0 = the quietest) is taken as the noise.
+    pub quantile: f32,
+    /// What that quantile of the variances of noise-only blocks is, as a fraction of their true variance.
+    pub correction: f32,
+}
+
+impl Default for NoiseProbe {
+    fn default() -> Self {
+        NoiseProbe { block: 12, quantile: 0.05, correction: 0.67 }
+    }
+}
+
+/// [`estimate_noise`] with its settings given.
+pub fn estimate_noise_with(mosaic: &[f32], width: usize, height: usize, probe: &NoiseProbe) -> (f32, f32) {
+    let (pw, ph) = (width / 2, height / 2);
+    let b = probe.block.clamp(6, 64);
+    if pw < b + 2 || ph < b + 2 || width.checked_mul(height) != Some(mosaic.len()) {
+        return (0.0, MIN_VARIANCE);
+    }
+    let mut blocks: Vec<(f32, f32)> = Vec::new();
+    let mut plane = vec![0f32; pw * ph];
+    for c in 0..4 {
+        let (dx, dy) = (c % 2, c / 2);
+        for (y, row) in plane.chunks_exact_mut(pw).enumerate() {
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = mosaic.get((2 * y + dy) * width + 2 * x + dx).copied().unwrap_or(0.0);
+            }
+        }
+        let at = |x: usize, y: usize| plane.get(y * pw + x).copied().unwrap_or(0.0);
+        let mut by = 1;
+        while by + b < ph {
+            let mut bx = 1;
+            while bx + b < pw {
+                let (mut sum, mut sq, mut top) = (0f64, 0f64, f32::MIN);
+                for y in by..by + b {
+                    for x in bx..bx + b {
+                        let m = at(x, y);
+                        let r = 4.0 * m - 2.0 * (at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1))
+                            + (at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1));
+                        sum += f64::from(m);
+                        sq += f64::from(r * r);
+                        top = top.max(m);
+                    }
+                }
+                let cells = (b * b) as f64;
+                let (mean, variance) = ((sum / cells) as f32, (sq / cells / 36.0) as f32);
+                if top < CLIPPED && mean.is_finite() && variance.is_finite() {
+                    blocks.push((mean, variance));
+                }
+                bx += b;
+            }
+            by += b;
+        }
+    }
+    fit_quiet_blocks(blocks, probe.quantile, probe.correction)
+}
+
+/// Fit `variance = a · signal + b` through the `(mean, variance)` of blocks: at each brightness (about 300 blocks of
+/// each) the `quantile` of the variances, divided by `correction`, is the noise.
+fn fit_quiet_blocks(mut blocks: Vec<(f32, f32)>, quantile: f32, correction: f32) -> (f32, f32) {
+    if blocks.is_empty() {
+        return (0.0, MIN_VARIANCE);
+    }
+    blocks.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let groups = (blocks.len() / 300).clamp(1, 10);
+    let q = if quantile.is_finite() { quantile.clamp(0.0, 0.5) } else { 0.1 };
+    let correction = if correction.is_finite() && correction > 0.05 { correction } else { 1.0 };
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    for g in 0..groups {
+        let slice = blocks.get(g * blocks.len() / groups..(g + 1) * blocks.len() / groups).unwrap_or(&[]);
+        if slice.is_empty() {
+            continue;
+        }
+        let mean = slice.iter().map(|b| f64::from(b.0)).sum::<f64>() / slice.len() as f64;
+        let mut variances: Vec<f32> = slice.iter().map(|b| b.1).collect();
+        variances.sort_by(f32::total_cmp);
+        let quiet = variances.get(((variances.len() as f32 * q) as usize).min(variances.len().saturating_sub(1))).copied().unwrap_or(0.0);
+        points.push((mean, f64::from(quiet / correction)));
+    }
+    fit_line(&points)
+}
+
+/// The noise of a whole mosaic as `(a, b)` (variance = `a · signal + b`), from blocks spread over the picture. This is
+/// the first version (blocks mix the colour planes, a plain neighbour difference, the lower quarter of the blocks):
+/// it reads texture as noise and reports at least about 0.003 at mid-grey whatever the noise. Kept to compare with.
+pub fn estimate_noise_v1(mosaic: &[f32], width: usize, height: usize) -> (f32, f32) {
     const SIDE: usize = 32;
     const MOST_BLOCKS: usize = 6000;
     let mut blocks: Vec<(f32, f32)> = Vec::new();
@@ -196,17 +296,28 @@ fn fit_noise(mut blocks: Vec<(f32, f32)>) -> (f32, f32) {
     }
     blocks.sort_by(|x, y| x.0.total_cmp(&y.0));
     let groups = (blocks.len() / 8).clamp(1, 6);
-    let mut points: Vec<(f64, f64)> = Vec::new();
-    for g in 0..groups {
-        let slice = blocks.get(g * blocks.len() / groups..(g + 1) * blocks.len() / groups).unwrap_or(&[]);
-        if slice.is_empty() {
-            continue;
+    let points: Vec<(f64, f64)> = {
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for g in 0..groups {
+            let slice = blocks.get(g * blocks.len() / groups..(g + 1) * blocks.len() / groups).unwrap_or(&[]);
+            if slice.is_empty() {
+                continue;
+            }
+            let mean = slice.iter().map(|b| f64::from(b.0)).sum::<f64>() / slice.len() as f64;
+            let mut variances: Vec<f32> = slice.iter().map(|b| b.1).collect();
+            variances.sort_by(f32::total_cmp);
+            let quiet = variances.get(variances.len() / 4).copied().unwrap_or(0.0);
+            points.push((mean, f64::from(quiet)));
         }
-        let mean = slice.iter().map(|b| f64::from(b.0)).sum::<f64>() / slice.len() as f64;
-        let mut variances: Vec<f32> = slice.iter().map(|b| b.1).collect();
-        variances.sort_by(f32::total_cmp);
-        let quiet = variances.get(variances.len() / 4).copied().unwrap_or(0.0);
-        points.push((mean, f64::from(quiet)));
+        points
+    };
+    fit_line(&points)
+}
+
+/// The line `variance = a · signal + b` through `(signal, variance)` points, with neither `a` nor `b` negative.
+fn fit_line(points: &[(f64, f64)]) -> (f32, f32) {
+    if points.is_empty() {
+        return (0.0, MIN_VARIANCE);
     }
     let n = points.len() as f64;
     let (sx, sy) = points.iter().fold((0.0, 0.0), |s, p| (s.0 + p.0, s.1 + p.1));
@@ -439,6 +550,63 @@ mod tests {
         assert_eq!(estimate_noise(&mosaic, s, s - 1).1, MIN_VARIANCE);
         assert_eq!(estimate_noise(&[], 0, 0).1, MIN_VARIANCE);
         assert_eq!(estimate_noise(&mosaic, usize::MAX, usize::MAX).1, MIN_VARIANCE);
+    }
+
+    /// A 640 x 640 mosaic: a smooth slope (dark at the top, bright at the bottom), texture (fine lines, edges) over its
+    /// left part and flat over the rest, with noise of variance `a · signal + b` added.
+    fn textured_and_flat(a: f32, b: f32, flat_from: usize, seed: u64) -> Vec<f32> {
+        let s = 640;
+        let mut rng = Noise(seed);
+        (0..s * s)
+            .map(|i| {
+                let (x, y) = (i % s, i / s);
+                let slope = 0.02 + 0.6 * y as f32 / s as f32 + 0.1 * x as f32 / s as f32;
+                let texture = if x < flat_from {
+                    0.04 * ((x as f32 * 1.3).sin() + (y as f32 * 0.9).sin()) + if (x / 9 + y / 7) % 2 == 0 { 0.05 } else { 0.0 }
+                } else {
+                    0.0
+                };
+                let v = (slope + texture).max(0.0);
+                v + rng.normal() * (a * v + b).sqrt()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_noise_is_read_from_the_flat_areas_and_not_from_the_texture_beside_them() {
+        let (a, b) = (5e-4f32, 1e-6f32);
+        // texture over the left 70 % and flat over the rest: the flat part is what shows the noise
+        let mosaic = textured_and_flat(a, b, 450, 7);
+        let (ea, eb) = estimate_noise(&mosaic, 640, 640);
+        for signal in [0.1f32, 0.2, 0.4] {
+            let (want, got) = ((a * signal + b).sqrt(), (ea * signal + eb).sqrt());
+            assert!((got / want - 1.0).abs() < 0.25, "the deviation at {signal}: {got} against {want}");
+        }
+        // the first version read the texture as noise (several times too much); this one is far closer
+        let old = estimate_noise_v1(&mosaic, 640, 640);
+        assert!(((old.0 * 0.2 + old.1) / (a * 0.2 + b)).sqrt() > 1.4, "the first version is the thing this one improves on");
+    }
+
+    #[test]
+    fn a_picture_with_no_flat_area_reads_noisier_than_it_is_never_quieter() {
+        let (a, b) = (5e-4f32, 1e-6f32);
+        let mosaic = textured_and_flat(a, b, 640, 9);
+        let (ea, eb) = estimate_noise(&mosaic, 640, 640);
+        for signal in [0.1f32, 0.3] {
+            assert!(ea * signal + eb >= 0.9 * (a * signal + b), "at {signal}: {} against {}", ea * signal + eb, a * signal + b);
+        }
+    }
+
+    #[test]
+    fn a_clipped_or_all_dark_mosaic_is_measured_without_a_panic() {
+        for level in [0.0f32, 1.0, f32::NAN] {
+            let mosaic = vec![level; 200 * 200];
+            let (a, b) = estimate_noise(&mosaic, 200, 200);
+            assert!(a.is_finite() && b.is_finite() && a >= 0.0 && b > 0.0, "{level}: {a} {b}");
+        }
+        let probe = NoiseProbe { block: 0, quantile: f32::NAN, correction: -1.0 };
+        let (a, b) = estimate_noise_with(&vec![0.3; 200 * 200], 200, 200, &probe);
+        assert!(a.is_finite() && b.is_finite());
     }
 
     #[test]

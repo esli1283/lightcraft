@@ -84,6 +84,7 @@ Beta-blocking gaps (B) total **~230–430 h**; with the stability and platform w
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-24 | minor | AI Denoise measures a photo's noise by colour channel and ignores texture, and sets its strength from it (fitted on real Canon EOS R / R6 Mark III noise levels: up to 5.5 dB closer to the original at ISO 51200, 2.2 to 2.7 dB at ISO 25600); gap 11 unchanged |
 | 2026-10-24 | minor | The built-in denoiser filters with block-matching collaborative filtering instead of non-local means (+0.25 to +0.6 dB on a public raw with added noise) and runs that filter on the graphics card where there is one (6 to 10 times faster per photo on an RTX 4080 SUPER, the same picture); gap 11 still stands (no X-Trans, no trained weights) |
 | 2026-10-23 | minor | AI Denoise runs out of the box with a built-in pure-Rust denoiser; gap 11 no longer says nobody gets denoise without installing a model |
 | 2026-10-22 | patch | XMP namespace-prefix collisions no longer overwrite foreign metadata; ranked gaps and estimates unchanged |

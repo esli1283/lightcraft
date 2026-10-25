@@ -139,9 +139,32 @@ fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
     let (w, h) = (1536usize, 1024usize);
     let (ox, oy) = (((n.width - w) / 2) & !1, ((n.height - h) / 2) & !1);
     let truth: Vec<f32> = (0..w * h).map(|i| n.data[(oy + i / w) * n.width + ox + i % w]).collect();
+    // LC_BIN=1: average each cell with the three nearest of its own colour (a 2 x 2 binning of the colour pattern's
+    // cells), which halves the reference's own noise so that noise added at a camera's low levels dominates it
+    let (w, h, truth) = if std::env::var("LC_BIN").is_ok_and(|v| v != "0") {
+        let (bw, bh) = (w / 2, h / 2);
+        let binned: Vec<f32> = (0..bw * bh)
+            .map(|i| {
+                let (x, y) = (i % bw, i / bw);
+                let (sx, sy, cx, cy) = (x / 2, y / 2, x % 2, y % 2);
+                let at = |di: usize, dj: usize| truth[(2 * (2 * sy + dj) + cy) * w + 2 * (2 * sx + di) + cx];
+                (at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) / 4.0
+            })
+            .collect();
+        (bw, bh, binned)
+    } else {
+        (w, h, truth)
+    };
     let mean = truth.iter().map(|v| f64::from(*v)).sum::<f64>() / truth.len() as f64;
     let scale = (0.18 / mean) as f32;
     let truth_rgb = plain(&truth, w, h);
+    let own = estimate_noise(&truth, w, h);
+    println!(
+        "the reference's own noise by the estimator: a {:.5} b {:.6} (sd at 0.18 {:.4}); a clean reference would read about 0",
+        own.0,
+        own.1,
+        (own.0 * 0.18 + own.1).sqrt()
+    );
     println!("{path}: {}x{}, window {w}x{h}, mean {mean:.4}", n.width, n.height);
     println!("{:<14}{:>10}{:>10}{:>9}{:>9}{:>9}{:>9}", "noise (a, b)", "noisy dB", "denoised", "gain", "detail", "texture", "seconds");
     let out_dir = std::env::var("LC_DENOISE_OUT").ok();
@@ -152,12 +175,35 @@ fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
         println!("on the graphics card: {} ({})", g.adapter(), g.build_report());
         std::sync::Arc::new(g)
     });
-    for (name, a, b) in [("light", 0.002f32, 0.0002f32), ("medium", 0.008, 0.001), ("heavy", 0.025, 0.004), ("extreme", 0.06, 0.012)] {
+    // LC_REAL=1 runs the noise levels measured on real Canon EOS R / R6 Mark III raws instead (their standard deviation at
+    // mid-grey is 0.003, 0.006, 0.0095, 0.015 and 0.038: ISO <= 400, 1600, 6400, 25600 and above)
+    let levels: &[(&str, f32, f32)] = if std::env::var("LC_REAL").is_ok_and(|v| v != "0") {
+        &[("iso400", 4e-5, 1e-7), ("iso1600", 2.1e-4, 3e-7), ("iso6400", 4.9e-4, 1e-6), ("iso25600", 1.19e-3, 1.7e-5), ("iso51200", 6.9e-3, 2.08e-4)]
+    } else {
+        &[("light", 0.002, 0.0002), ("medium", 0.008, 0.001), ("heavy", 0.025, 0.004), ("extreme", 0.06, 0.012)]
+    };
+    for &(name, a, b) in levels {
         let mut rng = Rng(11);
         let noisy: Vec<f32> = truth.iter().map(|&v| v + rng.normal() * (a * v.max(0.0) + b).sqrt()).collect();
         let started = Instant::now();
         let params = Params { tile: TILE as usize, overlap: OVERLAP as usize, gain: Gain::None, clip: Some(0.99), parallel: 4 };
-        let est = estimate_noise(&noisy, w, h);
+        // LC_EST=v1 (the first estimator) | true (the noise that was added) | anything else: the current estimator
+        // LC_FULL=1: measure the noise on the whole frame with the same noise added, as the app does (it measures the whole
+        // photo), instead of on the crop
+        let measure = |mosaic: &[f32], mw: usize, mh: usize| match std::env::var("LC_EST").as_deref() {
+            Ok("v1") => lightcraft_denoise_core::builtin::estimate_noise_v1(mosaic, mw, mh),
+            _ => estimate_noise(mosaic, mw, mh),
+        };
+        let est = match std::env::var("LC_EST").as_deref() {
+            Ok("true") => (a, b),
+            _ if std::env::var("LC_TRUE").is_ok_and(|v| v != "0") => (a, b),
+            _ if std::env::var("LC_FULL").is_ok_and(|v| v != "0") => {
+                let mut rng = Rng(23);
+                let frame: Vec<f32> = n.data.iter().map(|&v| v + rng.normal() * (a * v.max(0.0) + b).sqrt()).collect();
+                measure(&frame, n.width, n.height)
+            }
+            _ => measure(&noisy, w, h),
+        };
         let mut tuning = Tuning::default();
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
         (tuning.search, tuning.search2) = (env("LC_S1").map_or(tuning.search, |v| v as usize), env("LC_S2").map_or(tuning.search2, |v| v as usize));
@@ -179,8 +225,12 @@ fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
                 env("LC_B_K").map_or(b.group, |v| v as usize),
             );
             (b.tau1, b.tau2) = (env("LC_B_T1").unwrap_or(b.tau1), env("LC_B_T2").unwrap_or(b.tau2));
-            (b.lambda, b.lambda_heavy, b.sigma) =
-                (env("LC_B_L").unwrap_or(b.lambda), env("LC_B_LH").unwrap_or(b.lambda_heavy), env("LC_B_SIG").unwrap_or(b.sigma));
+            // LC_B_LOFF adds to every point of the threshold curve (a sweep of how hard it cleans)
+            let off = env("LC_B_LOFF").unwrap_or(0.0);
+            for point in &mut b.lambda {
+                point.1 += off;
+            }
+            b.sigma = env("LC_B_SIG").unwrap_or(b.sigma);
             b.wiener = env("LC_B_WIENER").is_none_or(|v| v > 0.0);
         }
         let runner = Builtin { noise: Some(est), tuning };

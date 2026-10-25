@@ -798,6 +798,7 @@ Latin stays upright. Advanced Japanese composition remains open. Regression cove
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-24 | minor | LR-EDIT-DETAIL-DENOISE: the built-in denoiser measures noise by colour channel and ignores texture, and its strength follows the measured noise; status and counts unchanged |
 | 2026-10-24 | minor | LR-EDIT-DETAIL-DENOISE: the built-in denoiser filters with block-matching collaborative filtering instead of non-local means, and runs that filter on the graphics card where there is one; status and counts unchanged |
 | 2026-10-23 | minor | LR-EDIT-DETAIL-DENOISE: built-in denoiser, no model needed |
 | 2026-10-22 | patch | LR-META-XMP: namespace URI determines ownership; foreign namespaces using recognized prefixes survive saves and cannot supply native settings or ratings; status and counts unchanged |

@@ -10,8 +10,8 @@ reduction remain separate controls.
 
 AI Denoise needs no set-up. Unless you choose a model of your own (below), it runs the
 **built-in denoiser** (`crates/denoise-core/src/builtin.rs`, id `builtin`): it measures
-the photo's noise level once, from blocks spread over the whole mosaic (variance =
-a · signal + b), turns the noise into unit variance with a variance-stabilising transform,
+the photo's noise level once, from blocks of all four colour planes spread over the whole mosaic (variance =
+a · signal + b; see [How the noise is measured](#how-the-noise-is-measured)), turns the noise into unit variance with a variance-stabilising transform,
 and cleans the four Bayer planes together with block-matching collaborative filtering
 (`crates/denoise-core/src/bm3d.rs`, after the published BM3D / CBM3D method). The four planes are rotated
 into a brightness plane and three colour-difference planes; 4 × 4-cell blocks of the brightness plane that look alike
@@ -47,7 +47,8 @@ To measure a change to it, run the opt-in benchmark on a public CC0 raw (see `ca
 It adds noise of four known levels to the raw, runs the denoiser and prints the PSNR against the
 original, plus a texture figure (how much of the true picture's fine structure the result keeps; noise
 can't inflate it); `LC_DENOISE_OUT` also writes truth | noisy | denoised PNGs. Use public files only.
-`LC_B_N`, `LC_B_STEP`, `LC_B_S`, `LC_B_K`, `LC_B_T1`, `LC_B_T2`, `LC_B_L`, `LC_B_LH`, `LC_B_SIG` and `LC_B_WIENER`
+`LC_B_N`, `LC_B_STEP`, `LC_B_S`, `LC_B_K`, `LC_B_T1`, `LC_B_T2`, `LC_B_LOFF` (added to every point of the threshold curve),
+`LC_B_SIG` and `LC_B_WIENER`
 override the matching `bm3d::Params` field for a sweep; `LC_NLM=1` runs the non-local-means filter instead (then
 `LC_S1`, `LC_S2`, `LC_HL`, `LC_HH`, `LC_H2`, `LC_LIGHT`, `LC_HEAVY`, `LC_SC`, `LC_HC`, `LC_P1`, `LC_P2`,
 `LC_LOOSE` and `LC_FEW` override its `nlm::Tuning` fields).
@@ -81,15 +82,53 @@ papers (no GPL code), in the order tried:
   minute). Its singular values came from Jacobi rotations of each group's Gram matrix; more iterations, a smaller feedback
   and 6 × 6 blocks (115 s a crop) did not help. Not kept. Untried: patches over all four planes at once (about fourteen times
   the work per group).
-- **What the tuning showed** (for whoever changes it): the hard threshold has to rise with the noise (1.9 noise deviations at
-  light, 3.0 at heavy, `Params::lambda` / `lambda_heavy`; a fixed value wins at one level and loses at another); a higher
+- **What the tuning showed** (for whoever changes it): the hard threshold has to rise with the noise (`Params::lambda` is a curve
+  of the noise's deviation at mid-grey against the threshold: 1.2 at 0.0028, 1.9 at 0.0062, 2.3 at 0.0094, 2.65 at 0.0152, 3.2 at
+  0.038, 3.5 at 0.14; a fixed value wins at one level and loses at another, see
+  [Fitted on real cameras](#fitted-on-real-cameras)); a higher
   threshold on the colour planes than on the brightness plane hurts both PSNR and texture, because the colour differences
   carry real signal; 4 × 4 blocks beat 3, 5, 6 and 8 on quality (3 × 3 is a little faster, 6 × 6 and 8 × 8 much slower); the
   match tolerances and the group size (16 against 8 or 32) barely matter; a search of 8 cells and a step of 3 cost 0.1 dB
   against 12 and 2 and keep the
   processor as fast as non-local means. The Wiener step adds a little over the hard threshold alone.
-- **The benchmark's limit:** its noise is synthetic and white. Real high-ISO raws also have correlated, low-frequency colour
-  noise and banding, which this does not measure; judge a change to the real thing by eye on a public high-ISO raw too.
+- **The first benchmark's limit:** its noise is synthetic and white, and its reference (a public raw's own mosaic) has noise of
+  its own, which hides what happens at the low noise levels of real cameras. Real high-ISO raws also have correlated,
+  low-frequency colour noise and banding, which none of this measures; judge a change to the real thing by eye on a
+  high-ISO raw too.
+
+### How the noise is measured
+
+`builtin::estimate_noise` reads `(a, b)` of a photo (variance = `a · signal + b`, signal in 0..1 after black and white
+levels) from the picture itself, so no camera table is needed. Each of the four colour planes is read separately (they sit at
+different levels in a raw), cut into 12 × 12-cell blocks, and a second-difference operator (`[1 -2 1; -2 4 -2; 1 -2 1]`, which
+cancels flat and smoothly sloping signal; white noise has `36 σ²` of variance through it) gives each block's variance; texture
+and edges only add to it. At each brightness (about 300 blocks of each) the quietest 5 % of blocks are the noise, divided by
+the bias of that quantile of pure noise (0.67, measured by
+`denoise_noise_estimate::a_quantile_of_pure_noise_blocks_is_a_known_fraction_of_the_true_variance`), and a line is fitted
+through the points. The first version mixed the colour planes in each block and took the lower quarter of a plain
+neighbour difference: it read the picture's texture as noise, never below about 0.003 at mid-grey whatever the
+true noise (`estimate_noise_v1`, kept to compare). On 30 different public pictures with known noise added, the ratio of
+estimated to true deviation at mid-grey, at the ISO 6400 level of a Canon R-series body (0.0094), had a 10th to 90th percentile of
+0.97 to 1.29 against 0.94 to 1.96 for the first version, and at the ISO 1600 level (0.0062) 0.99 to 1.45 against 0.97 to 2.77
+(`LC_CORPUS=<corpus/raw> cargo test --release -p lightcraft-engine --test denoise_noise_estimate -- --ignored --nocapture`).
+A picture with no flat area at all still reads somewhat high, never low.
+
+### Fitted on real cameras
+
+A Canon EOS R, EOS R6 Mark III, M50 Mark II and some EF-era bodies were measured on a private library of about 8,400 raws
+(only aggregates were kept; no photo is in the repository). The deviation of the noise at mid-grey (the measure the filter
+judges a photo by) was about 0.0024 to 0.0028 at ISO 400 and below, 0.005 to 0.006 at ISO 500 to 1600, 0.009 to 0.010 at ISO 2000
+to 6400, 0.015 to 0.018 at ISO 8000 to 25600 and 0.038 above that: far lower than the first benchmark's levels (0.024 to
+0.14), so a filter tuned on those was too gentle exactly where these photos live. The curve above was fitted on clean low-ISO
+photos of those cameras with noise of their measured levels added (`LC_REAL=1`; `LC_FULL=1` measures the noise on the whole
+frame, as the app does). Against the first estimator with a constant threshold of 1.9, averaged over 10 EOS R and 5 R6 Mark III
+photos, the output reached (PSNR in dB, EOS R / R6 Mark III): ISO 400 level 43.76 / 44.93 (from 43.27 / 44.66), 1600 41.03 / 41.86
+(41.05 / 41.82), 6400 39.93 / 40.69 (39.30 / 39.74), 25600 38.36 / 38.86 (36.18 / 36.21) and 51200 level 33.83 / 34.45
+(28.42 / 28.78), with the noise left in the result ("detail" above 1) falling from 1.3 to 3.1 down to 0.73 to 0.99. The threshold
+at each level is the lowest that stays within about a quarter of a decibel of the best, so texture is kept (on the EOS R at the
+25600 level the texture figure is 0.28, against 0.25 at the highest-PSNR threshold). The first estimator also cost PSNR by itself: told the true
+noise instead of its estimate, the same filter did the right thing at every level; the new estimator is as good as that from
+ISO 6400 up.
 
 ## Models and terms (optional)
 

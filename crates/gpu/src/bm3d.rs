@@ -274,12 +274,12 @@ impl Bm3dGpu {
         self.wake.notify_one();
     }
 
-    /// Denoise four unit-noise planes of `t × t` cells as [`bm3d::filter`] does; `strength` as there.
-    pub fn filter(&self, planes: &[Vec<f32>], t: usize, strength: f32) -> Result<Vec<Vec<f32>>, Error> {
+    /// Denoise four unit-noise planes of `t × t` cells as [`bm3d::filter`] does; `noise` as there.
+    pub fn filter(&self, planes: &[Vec<f32>], t: usize, noise: f32) -> Result<Vec<Vec<f32>>, Error> {
         if let Some(why) = crate::nn::broken_reason() {
             return Err(Error::Runtime(format!("the GPU is not used any more: {why}")));
         }
-        let Some(plan) = bm3d::plan(&self.requested, t, strength).filter(|_| t == self.t) else {
+        let Some(plan) = bm3d::plan(&self.requested, t, noise).filter(|_| t == self.t) else {
             return Err(Error::Input("the tile is not the size the filter was made for".into()));
         };
         if planes.len() != 4 || planes.iter().any(|p| p.len() != t * t) {
@@ -428,9 +428,8 @@ impl BuiltinRunner {
     pub fn agreement(&self, input: &[f32]) -> Result<Agreement, Error> {
         let seen = std::cell::Cell::new(None);
         self.builtin.run_with(input, &|planes, t, noise| {
-            let strength = self.builtin.tuning.strength(noise);
-            let want = bm3d::filter(planes, t, &self.gpu.params(), strength);
-            let got = self.gpu.filter(planes, t, strength)?;
+            let want = bm3d::filter(planes, t, &self.gpu.params(), noise);
+            let got = self.gpu.filter(planes, t, noise)?;
             let (mut worst, mut sum, mut n) = (0f32, 0f64, 0usize);
             for (a, b) in want.iter().flatten().zip(got.iter().flatten()) {
                 let d = (a - b).abs();
@@ -447,7 +446,7 @@ impl BuiltinRunner {
 
 impl TileRunner for BuiltinRunner {
     fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
-        self.builtin.run_with(input, &|planes, t, noise| self.gpu.filter(planes, t, self.builtin.tuning.strength(noise)))
+        self.builtin.run_with(input, &|planes, t, noise| self.gpu.filter(planes, t, noise))
     }
 }
 
@@ -504,13 +503,13 @@ mod tests {
     #[test]
     fn the_gpu_gives_what_the_cpu_gives() {
         let p = Params::default();
-        for (t, seed, strength) in [(32usize, 1u64, 0.0f32), (64, 2, 0.5), (100, 3, 1.0), (256, 4, 0.3)] {
+        for (t, seed, noise) in [(32usize, 1u64, 0.003f32), (64, 2, 0.01), (100, 3, 0.04), (256, 4, 0.02)] {
             let Some(g) = gpu(&p, t) else { return };
             let planes = scene(t, seed);
-            let want = bm3d::filter(&planes, t, &p, strength);
-            let got = g.filter(&planes, t, strength).unwrap();
+            let want = bm3d::filter(&planes, t, &p, noise);
+            let got = g.filter(&planes, t, noise).unwrap();
             let (worst, mean) = differ(&got, &want);
-            eprintln!("{}: tile {t}, strength {strength}: worst {worst:e}, mean {mean:e} (noise deviation 1); {}", g.adapter(), g.build_report());
+            eprintln!("{}: tile {t}, noise {noise}: worst {worst:e}, mean {mean:e} (noise deviation 1); {}", g.adapter(), g.build_report());
             assert!(got.iter().flatten().all(|v| v.is_finite()));
             assert!(mean < 1e-3 && worst < 0.1, "tile {t}: the GPU is off by {worst:e} at most and {mean:e} on average");
         }
@@ -528,8 +527,8 @@ mod tests {
                 std::thread::spawn(move || {
                     for round in 0..3 {
                         let planes = scene(t, 10 + k * 7 + round);
-                        let want = bm3d::filter(&planes, t, &Params::default(), 0.5);
-                        let got = g.filter(&planes, t, 0.5).unwrap();
+                        let want = bm3d::filter(&planes, t, &Params::default(), 0.01);
+                        let got = g.filter(&planes, t, 0.01).unwrap();
                         let (worst, mean) = differ(&got, &want);
                         assert!(mean < 1e-3 && worst < 0.1, "thread {k}, round {round}: off by {worst:e} / {mean:e}");
                     }

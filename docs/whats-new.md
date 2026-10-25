@@ -2,6 +2,14 @@
 
 ## 2026-10-24
 
+### AI Denoise follows the photo's real noise
+- The built-in denoiser used to read a photo's fine texture as noise, so it always believed a photo was at least as noisy as
+  about ISO 12800 and over-smoothed quiet photos while under-cleaning noisy ones. It now measures each colour channel
+  separately, ignores texture, and sets its strength from the noise it actually finds. On clean photos from a Canon EOS R and
+  an R6 Mark III with noise added at real ISO levels, the result at ISO 25600 is 2.2 to 2.7 dB closer to the original, and at
+  ISO 51200 about 5.5 dB closer; at ISO 6400 it is 0.6 to 1.0 dB closer, and quiet photos are no longer smoothed
+  needlessly. Photos denoised before are denoised again when they are next needed. See [AI Denoise](denoise.md).
+
 ### Better built-in AI Denoise
 - The built-in denoiser now cleans with block-matching collaborative filtering: similar blocks of the picture are
   grouped, transformed together and thresholded, so more fine detail survives at the same level of cleaning. On a
