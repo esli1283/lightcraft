@@ -19,11 +19,13 @@ use std::time::Instant;
 struct Rng(u64);
 
 impl Rng {
+    /// The next uniform number, strictly between 0 and 1.
     fn uniform(&mut self) -> f32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32 + 0.5) / (1u64 << 24) as f32
     }
 
+    /// The next standard normal number (Box-Muller).
     fn normal(&mut self) -> f32 {
         let (u, v) = (self.uniform(), self.uniform());
         (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
@@ -61,10 +63,12 @@ fn plain(mosaic: &[f32], w: usize, h: usize) -> Vec<[f32; 3]> {
     out
 }
 
+/// A linear value encoded for viewing: clamped to 0..1, then gamma 2.2.
 fn gamma(v: f32) -> f32 {
     v.clamp(0.0, 1.0).powf(1.0 / 2.2)
 }
 
+/// PSNR in dB between two camera-RGB pictures after exposure `scale` and gamma, leaving out a 16-pixel border.
 fn psnr(a: &[[f32; 3]], b: &[[f32; 3]], w: usize, h: usize, scale: f32) -> f64 {
     let (mut sum, mut n) = (0f64, 0f64);
     for y in 16..h - 16 {
@@ -79,6 +83,7 @@ fn psnr(a: &[[f32; 3]], b: &[[f32; 3]], w: usize, h: usize, scale: f32) -> f64 {
     -10.0 * (sum / n).log10()
 }
 
+/// The summed gradient of the picture's green channel after exposure `scale` and gamma, leaving out a 16-pixel border.
 fn gradient(a: &[[f32; 3]], w: usize, h: usize, scale: f32) -> f64 {
     let mut sum = 0f64;
     for y in 16..h - 16 {
@@ -113,6 +118,7 @@ fn texture(a: &[[f32; 3]], truth: &[[f32; 3]], w: usize, h: usize, scale: f32) -
     xy / xx
 }
 
+/// A `side × side` crop of the picture from `(x0, y0)` as 8-bit RGB with a daylight white balance, for the PNGs.
 fn crop_rgb8(a: &[[f32; 3]], w: usize, (x0, y0): (usize, usize), side: usize, scale: f32) -> Vec<u8> {
     let wb = [2.0f32, 1.0, 1.6];
     let mut out = Vec::with_capacity(side * side * 3);
@@ -126,6 +132,8 @@ fn crop_rgb8(a: &[[f32; 3]], w: usize, (x0, y0): (usize, usize), side: usize, sc
     out
 }
 
+/// Adds noise of known levels to a public raw's mosaic, denoises it with the built-in denoiser and prints how close the
+/// result is to the untouched mosaic. Opt-in: it needs the raw named by `LC_DENOISE_RAW`.
 #[test]
 #[ignore = "needs a public raw: LC_DENOISE_RAW=<file>"]
 fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {

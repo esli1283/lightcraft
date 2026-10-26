@@ -12,21 +12,26 @@ use lightcraft_denoise_core::builtin::{NoiseProbe, estimate_noise_v1, estimate_n
 struct Rng(u64);
 
 impl Rng {
+    /// The next uniform number, strictly between 0 and 1.
     fn uniform(&mut self) -> f32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32 + 0.5) / (1u64 << 24) as f32
     }
 
+    /// The next standard normal number (Box-Muller).
     fn normal(&mut self) -> f32 {
         let (u, v) = (self.uniform(), self.uniform());
         (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
     }
 }
 
+/// The environment variable `k` as a number, if it is set and parses.
 fn env(k: &str) -> Option<f32> {
     std::env::var(k).ok().and_then(|v| v.parse().ok())
 }
 
+/// Prints what fraction of the true variance a quantile of pure-noise blocks' variances is, for each block size and
+/// quantile: the calibration behind `NoiseProbe::correction`.
 #[test]
 #[ignore = "calibration printout"]
 fn a_quantile_of_pure_noise_blocks_is_a_known_fraction_of_the_true_variance() {
@@ -62,6 +67,8 @@ fn binned_crop(n: &lightcraft_raw::Normalized, side: usize) -> Option<(Vec<f32>,
     Some((out, half))
 }
 
+/// Prints how the estimated noise compares with the noise added to crops of many raws, for the first version and for
+/// several settings of the current one. Opt-in: it needs the raw corpus folder named by `LC_CORPUS`.
 #[test]
 #[ignore = "needs the public raw corpus: LC_CORPUS=<folder>"]
 fn the_noise_estimate_follows_the_noise_added_to_many_different_pictures() {

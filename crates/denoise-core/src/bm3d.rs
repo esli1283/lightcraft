@@ -40,6 +40,8 @@ pub struct Params {
 }
 
 impl Default for Params {
+    /// What the built-in denoiser runs with: 4 × 4 blocks taken every 3 cells, matched within 8 cells, up to 16 to a
+    /// group, the fitted threshold curve, and the Wiener step on.
     fn default() -> Self {
         Params {
             block: 4,
@@ -90,6 +92,7 @@ fn bessel_i0(x: f32) -> f32 {
 }
 
 impl Transform {
+    /// The transform for `n × n` blocks: the DCT-II matrix and the Kaiser window the filtered blocks are put back with.
     fn new(n: usize) -> Self {
         let mut c = vec![0f32; n * n];
         for (k, row) in c.chunks_exact_mut(n).enumerate() {
@@ -171,6 +174,7 @@ fn haar_forward(v: &mut [f32], tmp: &mut [f32]) {
     }
 }
 
+/// Undoes [`haar_forward`] in place; `tmp` is scratch of the same length.
 fn haar_inverse(v: &mut [f32], tmp: &mut [f32]) {
     let mut len = 2;
     while len <= v.len() {
@@ -477,6 +481,7 @@ pub fn filter(planes: &[Vec<f32>], t: usize, p: &Params, noise: f32) -> Vec<Vec<
 mod tests {
     use super::*;
 
+    /// The DCT keeps a block's energy, and both it and the Haar transform are undone exactly by their inverses.
     #[test]
     fn the_dct_and_haar_transforms_invert() {
         for n in [2, 4, 8] {
@@ -518,11 +523,14 @@ mod tests {
             .collect()
     }
 
+    /// The deviation of the planes' values around `level`.
     fn spread(planes: &[Vec<f32>], level: f32) -> f32 {
         let all: Vec<f32> = planes.iter().flatten().copied().collect();
         (all.iter().map(|v| (v - level) * (v - level)).sum::<f32>() / all.len().max(1) as f32).sqrt()
     }
 
+    /// The threshold holds at the ends of the curve, passes through its points and never falls as the noise rises; a
+    /// noise that is not a number, an empty curve and curves out of order give a value instead of a panic.
     #[test]
     fn the_threshold_follows_the_noise_and_survives_odd_curves() {
         let c = Params::default().lambda;
@@ -545,6 +553,7 @@ mod tests {
         }
     }
 
+    /// Filtering a flat picture of pure noise leaves well under half of the noise's deviation.
     #[test]
     fn a_flat_noisy_picture_comes_out_much_quieter() {
         let t = 48;
@@ -555,6 +564,7 @@ mod tests {
         assert!(out.iter().flatten().all(|v| v.is_finite()));
     }
 
+    /// A step edge under noise stays a step: a few cells either side of it the values are still near their two levels.
     #[test]
     fn a_step_edge_stays_sharp() {
         let t = 48;
@@ -572,6 +582,8 @@ mod tests {
         assert!(at(t / 2 - 3) < 2.0 && at(t / 2 + 2) > 10.0, "{} {}", at(t / 2 - 3), at(t / 2 + 2));
     }
 
+    /// Tiny and empty tiles, planes of NaN, a tuning with a zero block, step or group, and no planes at all give finite
+    /// values or empty planes and never a panic.
     #[test]
     fn odd_inputs_never_panic() {
         // the sizes and values a tile or a caller could hand over

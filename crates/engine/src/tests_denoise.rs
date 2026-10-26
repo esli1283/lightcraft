@@ -861,6 +861,8 @@ fn denoise_row_while_queue_is_busy() {
     let _ = std::fs::remove_dir_all(&x.dir);
 }
 
+/// With no model installed, turning denoise on makes the picture with the built-in denoiser alone; it is not an
+/// installed model, and no model can take its id.
 #[test]
 fn without_a_model_the_built_in_denoiser_makes_the_picture_by_itself() {
     let mut x = setup("builtin", false);

@@ -57,6 +57,7 @@ struct Pipes {
     built: Vec<(String, f64)>,
 }
 
+/// Compile the three kernels (match, filter, put back) and make their bind-group layouts, timing each build.
 fn build_pipes(d: &Dev) -> Pipes {
     use wgpu::BufferBindingType::{Storage, Uniform};
     let (ro, rw) = (Storage { read_only: true }, Storage { read_only: false });
@@ -119,6 +120,7 @@ pub struct Bm3dGpu {
     wake: Condvar,
 }
 
+/// An error for something the kernels do not do, with `why` as its text.
 fn unsupported<T>(why: impl Into<String>) -> Result<T, String> {
     Err(why.into())
 }
@@ -185,6 +187,7 @@ impl Bm3dGpu {
         self.pipes.built.iter().map(|(k, ms)| format!("{k}: {ms:.0} ms")).collect::<Vec<_>>().join(", ")
     }
 
+    /// A new workspace for this runner's tile size: the plane, scratch and staging buffers and the six bind groups.
     fn workspace(&self) -> Workspace {
         let d = self.dev;
         let (t, groups) = (self.t, self.nr * self.nr);
@@ -261,6 +264,7 @@ impl Bm3dGpu {
         }
     }
 
+    /// A workspace comes back after a good run: it goes on the free list and one waiting caller is woken.
     fn give(&self, w: Workspace) {
         self.free.lock().unwrap_or_else(|e| e.into_inner()).push(w);
         self.wake.notify_one();
@@ -314,6 +318,8 @@ impl Bm3dGpu {
         }
     }
 
+    /// Run the filter's steps in `w` on the rotated planes `y` (one plane after another) and read the result back; a
+    /// device that runs out of memory or fails validation gives an error.
     fn execute(&self, w: &Workspace, y: &[f32], plan: &bm3d::Plan) -> Result<Vec<f32>, Error> {
         let d = self.dev;
         let p = &plan.params;
@@ -448,6 +454,7 @@ impl BuiltinRunner {
 }
 
 impl TileRunner for BuiltinRunner {
+    /// Clean one tile with the built-in pipeline, its block-matching filter running on the card.
     fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
         self.builtin.run_with(input, &|planes, t, noise| self.gpu.filter(planes, t, noise))
     }
@@ -503,6 +510,8 @@ mod tests {
         (worst, (sum / n.max(1) as f64) as f32)
     }
 
+    /// At four tile sizes the card's result is finite and within 0.1 noise deviations of the processor's at worst, and
+    /// 1e-3 on average.
     #[test]
     fn the_gpu_gives_what_the_cpu_gives() {
         let p = Params::default();
@@ -535,6 +544,7 @@ mod tests {
         assert_eq!(*g.made.lock().unwrap(), before.saturating_sub(1));
     }
 
+    /// One runner shared by four threads, each filtering several tiles, agrees with the processor on every one.
     #[test]
     fn a_runner_is_reusable_and_shared_between_threads() {
         let p = Params::default();
@@ -560,6 +570,8 @@ mod tests {
         }
     }
 
+    /// Block or group sizes the kernels are not written for, and tiles too small or too big, are errors; so are a tile
+    /// or planes of the wrong size. NaN input does not panic, and a flat tile stays flat.
     #[test]
     fn what_the_kernels_do_not_do_is_an_error_and_odd_inputs_never_panic() {
         // not the block or group size the kernels are written for, or too big a tile

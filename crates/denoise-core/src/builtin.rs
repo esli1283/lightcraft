@@ -62,6 +62,7 @@ pub struct Builtin {
 }
 
 impl Builtin {
+    /// The runner told the photo's noise as `(a, b)`, variance = `a · signal + b` (see [`estimate_noise`]), with the default tuning.
     pub fn with_noise(noise: (f32, f32)) -> Self {
         Builtin { noise: Some(noise), tuning: Tuning::default() }
     }
@@ -104,6 +105,7 @@ impl Builtin {
 }
 
 impl TileRunner for Builtin {
+    /// Clean one tile, all on the processor.
     fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
         self.run_with(input, &|planes, t, noise| Ok(self.filter_on_cpu(planes, t, noise)))
     }
@@ -174,6 +176,7 @@ pub struct NoiseProbe {
 }
 
 impl Default for NoiseProbe {
+    /// The settings the estimator was calibrated with: 12-cell blocks, the quietest 5 %, and the 0.67 bias of that quantile.
     fn default() -> Self {
         NoiseProbe { block: 12, quantile: 0.05, correction: 0.67 }
     }
@@ -412,11 +415,13 @@ mod tests {
     struct Noise(u64);
 
     impl Noise {
+        /// The next uniform number, strictly between 0 and 1.
         fn uniform(&mut self) -> f32 {
             self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((self.0 >> 40) as f32 + 0.5) / (1u64 << 24) as f32
         }
 
+        /// The next standard normal number (Box-Muller).
         fn normal(&mut self) -> f32 {
             let (u, v) = (self.uniform(), self.uniform());
             (-2.0 * u.ln()).sqrt() * (std::f32::consts::TAU * v).cos()
@@ -470,6 +475,7 @@ mod tests {
         sum / n
     }
 
+    /// A noisy tile comes out at least five times closer to the scene (squared error) than a plain demosaic of it.
     #[test]
     fn a_noisy_tile_comes_out_much_closer_to_the_scene_than_a_plain_demosaic() {
         let (t, a, b) = (64, 0.004, 0.0004);
@@ -481,6 +487,7 @@ mod tests {
         assert!(cleaned < plain / 5.0, "plain {plain}, cleaned {cleaned}");
     }
 
+    /// A tile with no noise is demosaiced almost exactly, and the step between two rows of its scene survives.
     #[test]
     fn a_noise_free_tile_is_demosaiced_without_blurring_its_edge() {
         let t = 64;
@@ -494,6 +501,7 @@ mod tests {
         assert!(below - above > 0.9 * 0.2 / 1.6, "{above} {below}");
     }
 
+    /// The tile's own noise model finds the added noise within 30 % at two brightness levels.
     #[test]
     fn the_noise_level_is_found_from_the_tile() {
         let (t, a, b) = (128, 0.004, 0.0004);
@@ -507,6 +515,7 @@ mod tests {
         }
     }
 
+    /// Black, mid-grey and fully clipped tiles give finite results that stay at their level.
     #[test]
     fn flat_dark_and_clipped_tiles_do_not_break_it() {
         let t = 32;
@@ -517,6 +526,7 @@ mod tests {
         }
     }
 
+    /// Empty tiles and tiles that are not four squares are errors; NaN and infinite values in a tile are cleaned up.
     #[test]
     fn bad_tiles_are_errors_and_bad_numbers_are_cleaned_up() {
         assert!(Builtin::default().run(&[]).is_err());
@@ -528,6 +538,8 @@ mod tests {
         assert!(Builtin::default().run(&input).unwrap().iter().all(|v| v.is_finite()));
     }
 
+    /// The whole-mosaic estimate finds the added noise within 25 %; a mosaic that is too small or not the size it says
+    /// gets the minimum variance instead of a panic.
     #[test]
     fn the_noise_of_a_whole_mosaic_is_found_and_hostile_mosaics_are_refused() {
         let (s, a, b) = (384, 0.01f32, 0.0005f32);
@@ -572,6 +584,8 @@ mod tests {
             .collect()
     }
 
+    /// With texture over most of the picture and a flat strip beside it, the estimate follows the strip's noise within
+    /// 25 % (in deviation), where the first version read the texture as several times too much.
     #[test]
     fn the_noise_is_read_from_the_flat_areas_and_not_from_the_texture_beside_them() {
         let (a, b) = (5e-4f32, 1e-6f32);
@@ -587,6 +601,7 @@ mod tests {
         assert!(((old.0 * 0.2 + old.1) / (a * 0.2 + b)).sqrt() > 1.4, "the first version is the thing this one improves on");
     }
 
+    /// A picture that is all texture is read as noisier than it is, never as meaningfully quieter.
     #[test]
     fn a_picture_with_no_flat_area_reads_noisier_than_it_is_never_quieter() {
         let (a, b) = (5e-4f32, 1e-6f32);
@@ -597,6 +612,7 @@ mod tests {
         }
     }
 
+    /// Black, fully clipped and NaN mosaics, and a nonsensical probe setting, give finite numbers and no panic.
     #[test]
     fn a_clipped_or_all_dark_mosaic_is_measured_without_a_panic() {
         for level in [0.0f32, 1.0, f32::NAN] {
@@ -609,6 +625,8 @@ mod tests {
         assert!(a.is_finite() && b.is_finite());
     }
 
+    /// A heavily noisy tile is cleaned to under an eighth of a plain demosaic's error, whether the runner measures the
+    /// noise itself or is told it.
     #[test]
     fn a_heavily_noisy_tile_is_cleaned_far_more_than_a_plain_demosaic_and_by_the_photos_noise() {
         let (t, a, b) = (64, 0.03, 0.004);
@@ -621,6 +639,8 @@ mod tests {
         assert!(own < plain / 8.0 && told < plain / 8.0, "plain {plain}, own {own}, told {told}");
     }
 
+    /// Noise values that are not numbers fall back to the tile's own measurement; a tuning with no search, and the
+    /// non-local-means fallback, still give finite pictures; and the strength rises with the noise from 0 to 1.
     #[test]
     fn noise_values_that_are_not_numbers_fall_back_to_the_tiles_own_and_the_strength_follows_the_noise() {
         let t = 32;
@@ -639,6 +659,7 @@ mod tests {
         assert!(ramp.windows(2).all(|w| w[0] <= w[1]) && ramp[0] == 0.0 && ramp[4] == 1.0, "{ramp:?}");
     }
 
+    /// The built-in denoiser's manifest passes the manifest check and carries the tile and overlap the runner uses.
     #[test]
     fn its_manifest_is_valid() {
         let m = manifest();

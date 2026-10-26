@@ -157,6 +157,7 @@ impl Model for BuiltinModel {
         (cpu, threads)
     }
 
+    /// Measure the whole photo's noise once, so every tile is cleaned by the photo's noise instead of its own.
     fn prepare(&self, mosaic: &[f32], width: usize, height: usize) {
         let _ = self.runner.set(lightcraft_denoise::builtin::Builtin::with_noise(lightcraft_denoise::builtin::estimate_noise(mosaic, width, height)));
     }
@@ -2288,6 +2289,8 @@ mod gpu_tests {
         assert!(mean < 1e-3 && far < 5e-3, "off by {mean:e} on average of the largest value, {far:e} of the values far off");
     }
 
+    /// With the card chosen, the built-in denoiser's tile agrees with the processor's, a few tiles feed the card at once,
+    /// and a set-up that ended leaves no marker; where there is no card it stays on the processor.
     #[test]
     fn the_built_in_denoiser_on_the_card_gives_the_cpus_tile() {
         use lightcraft_denoise::builtin::{Builtin, TILE};
@@ -2314,6 +2317,8 @@ mod gpu_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// With the processor chosen, the built-in denoiser gives the processor's tile bit for bit, uses all the threads
+    /// asked for and never sets the card up.
     #[test]
     fn with_the_processor_chosen_the_built_in_denoiser_runs_on_the_cpu_and_never_starts_the_card() {
         use lightcraft_denoise::builtin::{Builtin, TILE};
@@ -2328,6 +2333,8 @@ mod gpu_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A set-up marker left behind (the app closed while it ran) keeps the card off the built-in denoiser, with a reason
+    /// and a retry, until choosing where denoise runs forgets it.
     #[test]
     fn a_set_up_marker_left_behind_keeps_the_card_off_the_built_in_denoiser_until_a_choice_is_made() {
         let (m, dir) = builtin("builtin-marker");
@@ -2347,6 +2354,8 @@ mod gpu_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The card's filter stays within the agreement limits of the processor's on the check tile, well inside them, and
+    /// gives the same answer every time.
     #[test]
     fn the_cards_filter_agrees_with_the_cpus_on_the_check_tile_and_gives_the_same_answer_every_time() {
         use lightcraft_denoise::builtin::{Builtin, TILE};
@@ -2367,6 +2376,8 @@ mod gpu_tests {
         agree(&Builtin::with_noise(CHECK_NOISE).run(&tile).unwrap(), &first);
     }
 
+    /// A tile the card cannot do (another size than it was made for) is run on the processor, and after three of them
+    /// the card is stopped for the built-in denoiser.
     #[test]
     fn a_tile_the_card_gets_wrong_is_run_on_the_processor_and_three_stop_the_card_for_the_built_in_denoiser() {
         use lightcraft_denoise::builtin::Builtin;

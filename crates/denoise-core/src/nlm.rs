@@ -47,6 +47,7 @@ pub struct Tuning {
 }
 
 impl Default for Tuning {
+    /// The built-in denoiser's tuning: block matching on, and the non-local-means settings it falls back to when that is off.
     fn default() -> Self {
         Tuning {
             search: 3,
@@ -87,10 +88,12 @@ pub struct Stabiliser {
 const MIN_GAIN: f32 = 1e-6;
 
 impl Stabiliser {
+    /// The transform for noise of variance `a · signal + b`; a gain or offset that is not a number counts as none.
     pub fn new(a: f32, b: f32) -> Self {
         Stabiliser { a: if a.is_finite() { a.max(0.0) } else { 0.0 }, b: if b.is_finite() { b.max(1e-12) } else { 1e-12 } }
     }
 
+    /// A value as a signal with unit noise deviation (a plain scaling when the noise has no signal-dependent part).
     pub fn forward(self, v: f32) -> f32 {
         if self.a < MIN_GAIN {
             return v / self.b.sqrt();
@@ -310,6 +313,8 @@ pub fn filter(planes: &[Vec<f32>], t: usize, tune: &Tuning, noise: f32) -> Vec<V
 mod tests {
     use super::*;
 
+    /// The transform is undone by its inverse within a little, a step of one noise deviation is a step of about 1
+    /// whatever the brightness, and with no signal-dependent noise it is a plain scaling.
     #[test]
     fn the_stabiliser_round_trips_and_gives_unit_noise() {
         let s = Stabiliser::new(0.01, 0.0005);
@@ -327,6 +332,7 @@ mod tests {
         assert!((flat.forward(0.1) - 5.0).abs() < 1e-4 && (flat.inverse(5.0) - 0.1).abs() < 1e-6);
     }
 
+    /// The Hadamard transform applied twice gives the planes back, and it keeps their energy.
     #[test]
     fn the_hadamard_transform_is_its_own_inverse_and_keeps_energy() {
         let planes: Vec<Vec<f32>> = (0..4).map(|c| (0..9).map(|i| (c * 9 + i) as f32 * 0.37 - 3.0).collect()).collect();
@@ -357,11 +363,13 @@ mod tests {
             .collect()
     }
 
+    /// The deviation of the planes' values around `level`.
     fn spread(planes: &[Vec<f32>], level: f32) -> f32 {
         let all: Vec<f32> = planes.iter().flatten().copied().collect();
         (all.iter().map(|v| (v - level) * (v - level)).sum::<f32>() / all.len().max(1) as f32).sqrt()
     }
 
+    /// The colour planes' own pass leaves less noise than brightness alone would, and takes unit noise well below 0.5.
     #[test]
     fn the_colour_pass_cleans_colour_planes_further_than_brightness_alone_would() {
         let (t, noise) = (40, 0.2);
@@ -373,6 +381,7 @@ mod tests {
         assert!(spread(&with, 5.0) < 0.5, "unit noise should drop well below 0.5: {}", spread(&with, 5.0));
     }
 
+    /// A cell far from its surroundings, which no patch resembles, ends up nearer to them with the looser average than without it.
     #[test]
     fn a_cell_no_patch_resembles_is_not_left_as_a_speck_in_heavy_noise() {
         let (t, noise) = (40, 0.2);
@@ -390,6 +399,7 @@ mod tests {
         assert!(peak(&with) < peak(&without), "{} vs {}", peak(&with), peak(&without));
     }
 
+    /// Noise of 0, NaN or next to nothing, with one cell far from the rest, still gives finite values.
     #[test]
     fn a_photo_with_no_measured_noise_stays_finite_even_with_an_odd_cell() {
         let t = 24;

@@ -501,6 +501,8 @@ impl crate::render::RenderOffload for RenderGate {
 
 #[cfg(test)]
 mod tests {
+    /// A raw photo is offered the AI Denoise switch with no set-up and one click turns it on with the built-in
+    /// denoiser; Settings still offers installing a model, and a photo that is not raw is not offered it.
     #[test]
     fn detail_offers_ai_denoise_for_raw_photos_without_any_set_up() {
         use crate::state::Dialog;
