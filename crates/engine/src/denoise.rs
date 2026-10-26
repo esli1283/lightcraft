@@ -384,7 +384,10 @@ fn set_up_card<T: Send + 'static, R>(
             return Err(GPU_CRASHED.into());
         }
         let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        // a marker that cannot be written only loses the crash guard
+        // the models folder may not exist yet; a marker that cannot be written only loses the crash guard
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::write(marker, format!("setting up the graphics card for AI Denoise (unix time {secs})\n"));
         running.push(marker.to_path_buf());
         SetUpEnded(marker.to_path_buf())
@@ -2242,6 +2245,26 @@ mod gpu_tests {
         assert_eq!(r, Err(GPU_CRASHED.to_string()));
         assert!(!touched.load(Ordering::Relaxed) && marker.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_set_up_makes_the_folder_of_its_marker() {
+        let dir = folder("setup-folder").join("not").join("yet");
+        let marker = dir.join(GPU_SETUP_MARKER);
+        let (m, seen) = (marker.clone(), Arc::new(AtomicBool::new(false)));
+        let s = seen.clone();
+        let r = set_up_card(
+            &marker,
+            Duration::from_secs(10),
+            move || {
+                s.store(m.exists(), Ordering::Relaxed);
+                Ok(())
+            },
+            || (),
+        );
+        assert_eq!(r, Ok(((), ())));
+        assert!(seen.load(Ordering::Relaxed), "the crash guard is written even when the models folder was missing");
+        let _ = std::fs::remove_dir_all(dir.ancestors().nth(2).unwrap_or(&dir));
     }
 
     #[test]

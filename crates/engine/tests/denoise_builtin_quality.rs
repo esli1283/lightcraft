@@ -4,7 +4,7 @@
 //! scored against the untouched mosaic demosaiced the same way. PSNR is measured on gamma-encoded camera RGB; the
 //! detail figure is the gradient energy of the result over that of the truth (1 = as sharp, below 1 = smoother).
 //!
-//! LC_DENOISE_RAW=corpus/raw/arw-sony-a7m3-compressed.arw LC_DENOISE_OUT=/tmp/dn \
+//! LC_DENOISE_RAW=../../corpus/raw/arw-sony-a7m3-compressed.arw LC_DENOISE_OUT=/tmp/dn \
 //!   cargo test --release -p lightcraft-engine --test denoise_builtin_quality -- --ignored --nocapture
 //! LC_DENOISE_OUT, when set, receives side-by-side PNGs (truth | noisy | denoised) of a 100 % crop per level.
 
@@ -137,7 +137,7 @@ fn crop_rgb8(a: &[[f32; 3]], w: usize, (x0, y0): (usize, usize), side: usize, sc
 #[test]
 #[ignore = "needs a public raw: LC_DENOISE_RAW=<file>"]
 fn the_built_in_denoiser_scored_on_a_real_raw_with_added_noise() {
-    let path = std::env::var("LC_DENOISE_RAW").unwrap_or_else(|_| "corpus/raw/arw-sony-a7m3-compressed.arw".into());
+    let path = std::env::var("LC_DENOISE_RAW").unwrap_or_else(|_| "../../corpus/raw/arw-sony-a7m3-compressed.arw".into());
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let n = lightcraft_raw::decode(&bytes).unwrap().normalized().unwrap();
     let cfa = n.cfa.as_ref().unwrap();
