@@ -891,15 +891,19 @@ fn without_a_models_folder_the_cache_still_obeys_the_default_limit() {
     x.s.execute("denoise.toggle", &json!({"id": photo(&x.s).0, "enabled": true})).unwrap();
     pump_until_ready(&mut x.s, 1);
     x.s.set_denoise_models_dir(None);
-    let used = x.dir.join("library").join("denoise");
-    let stray = used.join("aaaa.lcdn");
-    // a sparse file: larger than the default limit without using the disk
-    let f = std::fs::File::create(&stray).unwrap();
-    f.set_len((u64::from(crate::denoise::DEFAULT_CACHE_GB) << 30) + 1).unwrap();
-    f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(1000)).unwrap();
-    drop(f);
-    x.s.denoise_evict(None);
-    assert!(!stray.exists(), "the stray picture goes");
-    assert_eq!(x.s.denoise_photo_state(photo(&x.s)), PhotoState::Ready, "the photo's own picture stays");
+    let limit = u64::from(crate::denoise::DEFAULT_CACHE_GB) << 30;
+    assert_eq!(x.s.denoise_cache_limit(), limit);
+    // sparse files are cheap on Unix only: elsewhere a file that size may reserve its space
+    #[cfg(unix)]
+    {
+        let stray = x.dir.join("library").join("denoise").join("aaaa.lcdn");
+        let f = std::fs::File::create(&stray).unwrap();
+        f.set_len(limit + 1).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(1000)).unwrap();
+        drop(f);
+        x.s.denoise_evict(None);
+        assert!(!stray.exists(), "the stray picture goes");
+        assert_eq!(x.s.denoise_photo_state(photo(&x.s)), PhotoState::Ready, "the photo's own picture stays");
+    }
     let _ = std::fs::remove_dir_all(&x.dir);
 }
