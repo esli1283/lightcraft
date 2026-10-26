@@ -1764,8 +1764,9 @@ impl Session {
     /// Keep the cache within its limit: the pictures nobody asks for go first, the oldest first; `keep` (the one just
     /// made) never goes. The index forgets what was deleted.
     pub(crate) fn denoise_evict(&mut self, keep: Option<&Path>) {
-        let Some(models) = self.denoise.models_dir.clone() else { return };
-        self.denoise_evict_to(read_settings(&models).cache_bytes(), keep);
+        // without a models folder the built-in denoiser still makes products, so the default limit applies
+        let settings = self.denoise.models_dir.as_deref().map(read_settings).unwrap_or_default();
+        self.denoise_evict_to(settings.cache_bytes(), keep);
     }
 
     /// [`Self::denoise_evict`] for a limit of `limit` bytes.

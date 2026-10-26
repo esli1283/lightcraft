@@ -883,3 +883,23 @@ fn without_a_model_the_built_in_denoiser_makes_the_picture_by_itself() {
     assert!(e.contains("builtin"), "{e}");
     let _ = std::fs::remove_dir_all(&x.dir);
 }
+
+/// A build with no models folder still makes products with the built-in denoiser, so its cache obeys the default limit.
+#[test]
+fn without_a_models_folder_the_cache_still_obeys_the_default_limit() {
+    let mut x = setup("builtin-evict", false);
+    x.s.execute("denoise.toggle", &json!({"id": photo(&x.s).0, "enabled": true})).unwrap();
+    pump_until_ready(&mut x.s, 1);
+    x.s.set_denoise_models_dir(None);
+    let used = x.dir.join("library").join("denoise");
+    let stray = used.join("aaaa.lcdn");
+    // a sparse file: larger than the default limit without using the disk
+    let f = std::fs::File::create(&stray).unwrap();
+    f.set_len((u64::from(crate::denoise::DEFAULT_CACHE_GB) << 30) + 1).unwrap();
+    f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(1000)).unwrap();
+    drop(f);
+    x.s.denoise_evict(None);
+    assert!(!stray.exists(), "the stray picture goes");
+    assert_eq!(x.s.denoise_photo_state(photo(&x.s)), PhotoState::Ready, "the photo's own picture stays");
+    let _ = std::fs::remove_dir_all(&x.dir);
+}
